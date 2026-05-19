@@ -18,17 +18,23 @@ import {
   KukuLogoSmall,
   PlusIcon,
   SearchIcon,
+  SettingsIcon,
 } from "~/components/icons";
 import TypingIndicator from "~/components/vault/typing_indicator";
+import {
+  getVaultSidebarFooterActionIds,
+  getVaultSidebarFooterVaultLabel,
+} from "~/components/vault/vault_sidebar_actions";
 import { createVaultEntryDragPayload, type VaultEntryDragPayload } from "~/lib/vault_drag";
 import { type FileEntry } from "~/lib/vault_fs";
 import { getParentPath } from "~/lib/vault_path";
 import { getContextKey } from "~/plugins/context_keys";
-import { getActiveTab, openTab } from "~/stores/files";
+import { getActiveTab, openSettings, openTab } from "~/stores/files";
 import {
   canMoveEntryToFolder,
   cancelEdit,
   confirmEdit,
+  createDemoVaultSamples,
   deleteEntry,
   findInTree,
   isFolderExpanded,
@@ -470,6 +476,11 @@ export default function VaultBrowser() {
   const isAiResponding = () => getContextKey("aiResponding") === true;
   const [draggingPath, setDraggingPath] = createSignal<string | null>(null);
   const [dropIndicatorPath, setDropIndicatorPath] = createSignal<string | null>(null);
+  const [isSelectingVault, setIsSelectingVault] = createSignal(false);
+  const [isCreatingDemo, setIsCreatingDemo] = createSignal(false);
+  const footerActionIds = () =>
+    getVaultSidebarFooterActionIds({ hasOpenVault: vaultState.rootPath != null });
+  const footerVaultLabel = () => getVaultSidebarFooterVaultLabel({ rootName: vaultState.rootName });
   const showRootEditInput = () =>
     vaultState.editState?.kind === "create" && vaultState.editState.parentPath === ""
       ? vaultState.editState
@@ -634,6 +645,34 @@ export default function VaultBrowser() {
     clearDragState();
   };
 
+  const handleSelectVault = async () => {
+    if (isSelectingVault()) return;
+
+    setIsSelectingVault(true);
+    try {
+      await selectVault();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("[VaultBrowser] Failed to select vault", error);
+    } finally {
+      setIsSelectingVault(false);
+    }
+  };
+
+  const handleCreateDemoVaultSamples = async () => {
+    if (isCreatingDemo()) return;
+
+    setIsCreatingDemo(true);
+    try {
+      await createDemoVaultSamples();
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.error("[VaultBrowser] Failed to create demo vault samples", error);
+    } finally {
+      setIsCreatingDemo(false);
+    }
+  };
+
   onMount(() => {
     window.addEventListener("mousemove", handleDocumentMouseMove, true);
     window.addEventListener("mouseup", handleDocumentMouseUp, true);
@@ -704,7 +743,19 @@ export default function VaultBrowser() {
             <Show
               when={showRootEditInput() || vaultState.files.length > 0}
               fallback={
-                <p class="px-2 py-8 text-center text-xs text-text-muted">{t("vault.empty.tree")}</p>
+                <div class="flex min-h-40 flex-col items-center justify-center gap-3 px-4 py-8 text-center">
+                  <p class="text-xs text-text-muted">{t("vault.empty.tree")}</p>
+                  <button
+                    type="button"
+                    class="rounded-xs border border-border px-3 py-1.5 text-xs text-text-secondary transition-colors hover:bg-ghost-hover hover:text-text-primary disabled:cursor-default disabled:opacity-50"
+                    disabled={isCreatingDemo()}
+                    onClick={() => void handleCreateDemoVaultSamples()}
+                  >
+                    {isCreatingDemo()
+                      ? t("vault.empty.action.creating_demo")
+                      : t("vault.empty.action.create_demo")}
+                  </button>
+                </div>
               }
             >
               <Show when={showRootEditInput()}>
@@ -736,8 +787,43 @@ export default function VaultBrowser() {
         </ScrollArea>
       </Show>
 
-      <DragPreview />
       <TypingIndicator />
+
+      <Show when={footerActionIds().length > 0}>
+        <div class="flex shrink-0 items-center justify-between border-t border-border px-2 py-1.5">
+          <div class="flex min-w-0 items-center gap-1.5">
+            <Show when={footerActionIds().includes("switch-vault")}>
+              <button
+                type="button"
+                class="flex h-[26px] max-w-full min-w-0 shrink cursor-pointer items-center gap-1.5 rounded-xs border-none bg-transparent px-1.5 text-icon-muted transition-colors hover:bg-ghost-hover hover:text-icon disabled:cursor-default disabled:opacity-50"
+                title={vaultState.rootPath ?? footerVaultLabel() ?? t("vault.action.switch_vault")}
+                disabled={isSelectingVault()}
+                onClick={() => void handleSelectVault()}
+              >
+                <FolderIcon size={15} class="shrink-0" />
+                <Show when={footerVaultLabel()}>
+                  {(label) => (
+                    <span class="min-w-0 truncate text-[0.75rem] text-text-muted">{label()}</span>
+                  )}
+                </Show>
+              </button>
+            </Show>
+          </div>
+
+          <Show when={footerActionIds().includes("settings")}>
+            <button
+              type="button"
+              class="flex size-[26px] cursor-pointer items-center justify-center rounded-xs border-none bg-transparent text-icon-muted transition-colors hover:bg-ghost-hover hover:text-icon"
+              title={t("vault.action.settings")}
+              onClick={() => openSettings()}
+            >
+              <SettingsIcon size={15} />
+            </button>
+          </Show>
+        </div>
+      </Show>
+
+      <DragPreview />
     </div>
   );
 }

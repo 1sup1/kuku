@@ -1,3 +1,5 @@
+import type { ChatPermissionPresetId } from "./permission_presets";
+
 type ChatMode = "ask" | "agent" | "inline";
 type FinishReason = string;
 type ChatSessionStatus = "idle" | "streaming" | "awaiting-approval" | "applying" | "error";
@@ -109,6 +111,11 @@ interface ToolDescriptor {
   category: string;
   access?: "readOnly" | "proposesMutation";
   source?: "native" | "proxy";
+  kind?: "read" | "search" | "edit" | "proposal" | "navigation" | "other";
+  riskLevel?: "low" | "medium" | "high";
+  requiresApproval?: boolean;
+  modeAvailability?: ChatMode[];
+  permissionRuleKey?: string;
 }
 
 interface ChatTextMessage {
@@ -151,6 +158,8 @@ type ChatMessage = ChatTextMessage | ChatToolMessage | ChatApprovalMessage;
 interface ChatSessionState {
   id: string;
   mode: ChatMode;
+  createdAt: number;
+  updatedAt: number;
   draft: string;
   fileAttachments: ChatFileAttachmentDraft[];
   messages: ChatMessage[];
@@ -159,6 +168,17 @@ interface ChatSessionState {
   status: ChatSessionStatus;
   error: string | null;
   finishReason: FinishReason | null;
+}
+
+interface ChatSessionSummary {
+  id: string;
+  mode: ChatMode;
+  title: string;
+  draft: string;
+  messageCount: number;
+  status: ChatSessionStatus;
+  isActive: boolean;
+  updatedAt: number;
 }
 
 interface ChatConfigState {
@@ -177,6 +197,7 @@ interface ChatConfigState {
 
 interface ChatStoreState {
   selectedMode: ChatMode;
+  permissionPreset: ChatPermissionPresetId;
   activeSessionId: string | null;
   sessions: Record<string, ChatSessionState>;
   isCreatingSession: boolean;
@@ -202,6 +223,7 @@ export type {
   ChatMessageAttachment,
   ChatMode,
   ChatSessionState,
+  ChatSessionSummary,
   ChatSnapshotSource,
   ChatStoreState,
   ChatTextMessage,

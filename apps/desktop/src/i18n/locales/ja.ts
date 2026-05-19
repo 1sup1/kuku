@@ -7,6 +7,8 @@ export const JA_MESSAGES = {
   "settings.nav.files": "ファイルとリンク",
   "settings.nav.keybindings": "キーバインド",
   "settings.nav.plugins": "プラグイン",
+  "settings.dialog.title": "設定",
+  "settings.dialog.close": "設定を閉じる",
   "settings.plugin.account": "アカウント",
   "settings.plugin.indexer": "インデクサ",
   "settings.plugin.sync": "同期",
@@ -449,6 +451,8 @@ export const JA_MESSAGES = {
   "vault.action.quick_search": "クイック検索",
   "vault.action.new_folder": "新規フォルダー",
   "vault.action.new_file": "新規ファイル",
+  "vault.action.switch_vault": "Vaultを切り替え",
+  "vault.action.settings": "設定",
   "vault.input.folder_name": "フォルダー名",
   "vault.input.file_name": "ファイル名",
   "vault.context.rename": "名前を変更",
@@ -463,6 +467,8 @@ export const JA_MESSAGES = {
   "vault.empty.description.none": "ボルトフォルダーを選択すると、ファイルの閲覧を開始できます。",
   "vault.empty.action.working": "処理中...",
   "vault.empty.action.select_vault": "ボルトを選択",
+  "vault.empty.action.create_demo": "サンプルノートを作成",
+  "vault.empty.action.creating_demo": "作成中...",
   "vault.empty.tree": "このボルトは空です。",
 
   "search.placeholder": "ボルトを検索",
@@ -536,9 +542,22 @@ export const JA_MESSAGES = {
   "chat.input.stop": "停止",
   "chat.header.cancel": "キャンセル",
   "chat.header.clear": "チャットをクリア",
+  "chat.header.session_select": "チャットセッションを切り替え",
   "chat.header.auto_accept": "自動承認",
   "chat.header.auto_accept.on_title": "自動承認がオンです。承認待ちの変更を自動で許可します。",
   "chat.header.auto_accept.off_title": "自動承認がオフです。変更前に確認します。",
+  "chat.permission.default.label": "基本権限",
+  "chat.permission.default.description":
+    "安全なワークスペース範囲のツールを使い、変更前に確認します。",
+  "chat.permission.auto_review.label": "自動レビュー",
+  "chat.permission.auto_review.description":
+    "基本権限の範囲を保ち、リスクのある作業を承認前にレビューします。",
+  "chat.permission.full_access.label": "フルアクセス",
+  "chat.permission.full_access.description":
+    "より広いAgentワークフローを有効にしつつ、高リスクの確認は維持します。",
+  "chat.permission.full_access.confirm":
+    "フルアクセスはより広いAgentワークフローを有効にします。高リスクの変更は引き続き確認が必要です。続行しますか？",
+  "chat.permission.selector.disabled": "権限選択はまだAI実行ポリシーに接続されていません。",
   "chat.loading": "読み込み中",
   "chat.thinking": "考え中",
   "chat.attachment.selected_text": "選択テキスト",
@@ -562,12 +581,19 @@ export const JA_MESSAGES = {
   "chat.welcome.try_asking": "こんな質問から",
   "chat.welcome.s1.text": "隠れたつながりを発見",
   "chat.welcome.s1.hint": "関連ノートと関係性を可視化",
+  "chat.welcome.s1.prompt":
+    "この文書に関連するノートを探し、それぞれがどうつながるかを示してください",
   "chat.welcome.s2.text": "重要な洞察を抽出",
   "chat.welcome.s2.hint": "要約し、次に掘るべき問いを提案",
+  "chat.welcome.s2.prompt": "この文書を明確に要約し、次に検討する質問を提案してください",
   "chat.welcome.s3.text": "新しいアイデアを統合",
   "chat.welcome.s3.hint": "思考をリンクされたノートに展開",
+  "chat.welcome.s3.prompt":
+    "元の文書をもとに、既存ノートへのリンクを含むwiki下書きを作成してください",
   "chat.welcome.s4.text": "ボルトを整理",
   "chat.welcome.s4.hint": "未接続ノートを見つけ、つながりを強化",
+  "chat.welcome.s4.prompt":
+    "ボルト内の未接続ノートを確認し、追加すべき具体的なリンクを提案してください",
 
   "tool.search_notes.label": "ノート検索",
   "tool.search_notes.active": "検索中",

@@ -161,6 +161,12 @@ function registerKnowledgeAiTools(
       toolId: "knowledge.memory_search",
       description: "Search committed Knowledge MemoryItems. This is read-only.",
       category: "knowledge",
+      access: "readOnly",
+      kind: "search",
+      riskLevel: "low",
+      requiresApproval: false,
+      modeAvailability: ["ask", "inline", "agent"],
+      permissionRuleKey: "knowledge.memory_search",
       parameters: {
         type: "object",
         properties: {
@@ -184,6 +190,12 @@ function registerKnowledgeAiTools(
       toolId: "knowledge.memory_context",
       description: "Return committed Knowledge memory context for a query. This is read-only.",
       category: "knowledge",
+      access: "readOnly",
+      kind: "read",
+      riskLevel: "low",
+      requiresApproval: false,
+      modeAvailability: ["ask", "inline", "agent"],
+      permissionRuleKey: "knowledge.memory_context",
       parameters: {
         type: "object",
         properties: {
@@ -210,6 +222,12 @@ function registerKnowledgeAiTools(
       description:
         "Search committed Knowledge wiki pages. This is read-only and only returns Knowledge/wiki pages.",
       category: "knowledge",
+      access: "readOnly",
+      kind: "search",
+      riskLevel: "low",
+      requiresApproval: false,
+      modeAvailability: ["ask", "inline", "agent"],
+      permissionRuleKey: "knowledge.wiki_search",
       parameters: {
         type: "object",
         properties: {
@@ -237,6 +255,12 @@ function registerKnowledgeAiTools(
       toolId: "knowledge.wiki_read",
       description: "Read and parse a committed Knowledge wiki page by path. This is read-only.",
       category: "knowledge",
+      access: "readOnly",
+      kind: "read",
+      riskLevel: "low",
+      requiresApproval: false,
+      modeAvailability: ["ask", "inline", "agent"],
+      permissionRuleKey: "knowledge.wiki_read",
       parameters: {
         type: "object",
         properties: {
@@ -261,6 +285,12 @@ function registerKnowledgeAiTools(
       description:
         "Return read-only Knowledge context by combining committed memory and wiki search hits.",
       category: "knowledge",
+      access: "readOnly",
+      kind: "search",
+      riskLevel: "low",
+      requiresApproval: false,
+      modeAvailability: ["ask", "inline", "agent"],
+      permissionRuleKey: "knowledge.knowledge_context",
       parameters: {
         type: "object",
         properties: {
@@ -292,6 +322,12 @@ function registerKnowledgeAiTools(
       description:
         "Create a Knowledge decision document that proposes memories for explicit user review. This never commits memory.",
       category: "knowledge",
+      access: "proposesMutation",
+      kind: "proposal",
+      riskLevel: "medium",
+      requiresApproval: true,
+      modeAvailability: ["agent"],
+      permissionRuleKey: "knowledge.memory_propose",
       parameters: {
         type: "object",
         properties: {
@@ -328,6 +364,12 @@ function registerKnowledgeAiTools(
       description:
         "Create a Knowledge decision document that proposes committed wiki pages for explicit user review. This never writes Knowledge/wiki pages.",
       category: "knowledge",
+      access: "proposesMutation",
+      kind: "proposal",
+      riskLevel: "medium",
+      requiresApproval: true,
+      modeAvailability: ["agent"],
+      permissionRuleKey: "knowledge.wiki_propose_page",
       parameters: {
         type: "object",
         properties: {
@@ -364,6 +406,12 @@ function registerKnowledgeAiTools(
       description:
         "Create a Knowledge decision document that proposes updates to existing committed wiki pages. This never applies the update.",
       category: "knowledge",
+      access: "proposesMutation",
+      kind: "proposal",
+      riskLevel: "medium",
+      requiresApproval: true,
+      modeAvailability: ["agent"],
+      permissionRuleKey: "knowledge.wiki_propose_update",
       parameters: {
         type: "object",
         properties: {
@@ -464,12 +512,16 @@ function wikiProposePageRequestFromArgs(args: Record<string, unknown>): WikiProp
   if (!Array.isArray(args.proposed_pages)) {
     throw new Error("proposed_pages is required");
   }
+  const sourceRefs = optionalArray(args.source_refs) as WikiProposePageRequest["source_refs"];
 
   return {
     title: optionalString(args.title),
     context: optionalString(args.context),
-    source_refs: optionalArray(args.source_refs) as WikiProposePageRequest["source_refs"],
-    proposed_pages: args.proposed_pages as WikiProposePageRequest["proposed_pages"],
+    source_refs: sourceRefs,
+    proposed_pages: normalizeWikiProposalBodies(
+      args.proposed_pages,
+      sourceRefs,
+    ) as WikiProposePageRequest["proposed_pages"],
     default_selection: parseDefaultSelection(args.default_selection),
   };
 }
@@ -478,14 +530,64 @@ function wikiProposeUpdateRequestFromArgs(args: Record<string, unknown>): WikiPr
   if (!Array.isArray(args.proposed_updates)) {
     throw new Error("proposed_updates is required");
   }
+  const sourceRefs = optionalArray(args.source_refs) as WikiProposeUpdateRequest["source_refs"];
 
   return {
     title: optionalString(args.title),
     context: optionalString(args.context),
-    source_refs: optionalArray(args.source_refs) as WikiProposeUpdateRequest["source_refs"],
-    proposed_updates: args.proposed_updates as WikiProposeUpdateRequest["proposed_updates"],
+    source_refs: sourceRefs,
+    proposed_updates: normalizeWikiProposalBodies(
+      args.proposed_updates,
+      sourceRefs,
+    ) as WikiProposeUpdateRequest["proposed_updates"],
     default_selection: parseDefaultSelection(args.default_selection),
   };
+}
+
+function normalizeWikiProposalBodies(
+  proposedPages: unknown[],
+  requestSourceRefs?: WikiProposePageRequest["source_refs"],
+): unknown[] {
+  return proposedPages.map((page) => {
+    if (!isRecord(page) || typeof page.body !== "string") return page;
+
+    const sourceRefs = [
+      ...(requestSourceRefs ?? []),
+      ...(Array.isArray(page.source_refs) ? page.source_refs : []),
+    ];
+    const body = preserveSourceRefWikilinkTargets(page.body, sourceRefs);
+
+    return body === page.body ? page : { ...page, body };
+  });
+}
+
+function preserveSourceRefWikilinkTargets(markdown: string, sourceRefs: unknown[]): string {
+  const refsByTitle = new Map<string, string>();
+  for (const sourceRef of sourceRefs) {
+    if (!isRecord(sourceRef)) continue;
+    if (typeof sourceRef.path !== "string" || sourceRef.path.trim() === "") continue;
+    if (typeof sourceRef.title !== "string" || sourceRef.title.trim() === "") continue;
+
+    refsByTitle.set(normalizeWikilinkLookupKey(sourceRef.title), sourceRef.path);
+  }
+
+  if (refsByTitle.size === 0) return markdown;
+
+  return markdown.replace(/\[\[([^\]\n|]+)\]\]/g, (match, rawTarget: string) => {
+    const displayText = rawTarget.trim();
+    const sourcePath = refsByTitle.get(normalizeWikilinkLookupKey(displayText));
+    if (!sourcePath || displayText === sourcePath) return match;
+
+    return `[[${sourcePath}|${displayText}]]`;
+  });
+}
+
+function normalizeWikilinkLookupKey(value: string): string {
+  return value.trim().toLocaleLowerCase();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function optionalString(value: unknown): string | undefined {

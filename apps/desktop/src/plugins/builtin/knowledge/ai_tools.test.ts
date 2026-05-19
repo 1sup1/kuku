@@ -35,6 +35,38 @@ describe("knowledge AI tools", () => {
     }
   });
 
+  it("classifies committed Knowledge reads as read-only and proposals as mutations", () => {
+    const registry = createRegistry();
+    const service = createService();
+
+    registerKnowledgeAiTools(registry, service);
+
+    const byName = new Map(registry.list().map((tool) => [tool.name, tool]));
+    for (const name of ["memory_search", "wiki_search", "knowledge_context"]) {
+      expect(byName.get(name)).toMatchObject({
+        access: "readOnly",
+        kind: "search",
+        riskLevel: "low",
+      });
+    }
+    for (const name of ["memory_context", "wiki_read"]) {
+      expect(byName.get(name)).toMatchObject({
+        access: "readOnly",
+        kind: "read",
+        riskLevel: "low",
+      });
+    }
+    for (const name of ["memory_propose", "wiki_propose_page", "wiki_propose_update"]) {
+      expect(byName.get(name)).toMatchObject({
+        access: "proposesMutation",
+        kind: "proposal",
+        riskLevel: "medium",
+        requiresApproval: true,
+        modeAvailability: ["agent"],
+      });
+    }
+  });
+
   it("calls memory_propose and returns the created decision document", async () => {
     const registry = createRegistry();
     const service = createService();
@@ -311,6 +343,54 @@ describe("knowledge AI tools", () => {
     expect("apply" in updateRequest).toBe(false);
   });
 
+  it("preserves source file paths when wiki proposal bodies use translated wikilink text", () => {
+    const createRequest = wikiProposePageRequestFromArgs({
+      proposed_pages: [
+        {
+          path: "Knowledge/wiki/sources/browser-cookie-notes.md",
+          page_type: "source",
+          title: "브라우저 쿠키 노트",
+          body: "관련 원본은 [[브라우저 쿠키 노트]]입니다.",
+          source_refs: [
+            {
+              path: "Projects/browser-cookie-notes.md",
+              title: "브라우저 쿠키 노트",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(createRequest.proposed_pages[0].body).toBe(
+      "관련 원본은 [[Projects/browser-cookie-notes.md|브라우저 쿠키 노트]]입니다.",
+    );
+  });
+
+  it("leaves existing explicit wikilink aliases intact", () => {
+    const updateRequest = wikiProposeUpdateRequestFromArgs({
+      proposed_updates: [
+        {
+          path: "Knowledge/wiki/sources/browser-cookie-notes.md",
+          expected_checksum:
+            "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+          page_type: "source",
+          title: "브라우저 쿠키 노트",
+          body: "관련 원본은 [[Projects/browser-cookie-notes.md|브라우저 쿠키 노트]]입니다.",
+          source_refs: [
+            {
+              path: "Projects/browser-cookie-notes.md",
+              title: "브라우저 쿠키 노트",
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(updateRequest.proposed_updates[0].body).toBe(
+      "관련 원본은 [[Projects/browser-cookie-notes.md|브라우저 쿠키 노트]]입니다.",
+    );
+  });
+
   it("normalizes memory_search and memory_context arguments", () => {
     expect(
       memorySearchRequestFromArgs({
@@ -392,6 +472,12 @@ function createRegistry(): AiProxyToolRegistry {
         description: tool.description,
         parameters: tool.parameters,
         category: tool.category,
+        access: tool.access,
+        kind: tool.kind,
+        riskLevel: tool.riskLevel,
+        requiresApproval: tool.requiresApproval,
+        modeAvailability: tool.modeAvailability,
+        permissionRuleKey: tool.permissionRuleKey,
         aiEnabled: tool.aiEnabled,
       }));
     },

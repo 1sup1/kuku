@@ -25,18 +25,11 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "~/components/ui";
-import { executePluginCommand } from "~/plugins/commands";
-import {
-  closeTab,
-  filesState,
-  openSettings,
-  openTab,
-  reorderTabs,
-  setActiveTab,
-} from "~/stores/files";
+import { executePluginCommand, isPluginCommandVisible } from "~/plugins/commands";
+import { getTabBarMoreActionIds } from "~/components/layout/tab_bar_actions";
+import { closeTab, filesState, openTab, reorderTabs, setActiveTab } from "~/stores/files";
 import {
   cancelEdit,
   confirmEdit,
@@ -102,6 +95,8 @@ function TabRenameInput(props: { editState: EditState }) {
 }
 
 export default function TabBar() {
+  const moreActionIds = getTabBarMoreActionIds();
+
   let scrollHandle: ScrollAreaHandle | undefined;
 
   const getViewport = () => scrollHandle?.viewport;
@@ -470,46 +465,31 @@ export default function TabBar() {
             <PlusIcon />
           </button>
 
-          <button
-            type="button"
-            class={ACTION_BTN}
-            onClick={() => {
-              void executePluginCommand("graph.cycle");
-            }}
-            title={t("tabbar.action.graph_shortcut")}
-          >
-            <GraphIcon size={14} />
-          </button>
+          <Show when={isPluginCommandVisible("graph.cycle")}>
+            <button
+              type="button"
+              class={ACTION_BTN}
+              onClick={() => {
+                void executePluginCommand("graph.cycle");
+              }}
+              title={t("tabbar.action.graph_shortcut")}
+            >
+              <GraphIcon size={14} />
+            </button>
+          </Show>
 
           <DropdownMenu>
             <DropdownMenuTrigger class={ACTION_BTN} title={t("tabbar.action.more_actions")}>
               <EllipsisVerticalIcon />
             </DropdownMenuTrigger>
             <DropdownMenuContent>
-              <DropdownMenuItem
-                label={t("tabbar.menu.new_tab")}
-                shortcut="⌘N"
-                onSelect={() => void createAndOpenNewFile()}
-              />
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                label={t("center.empty.advanced_search")}
-                shortcut="⌘U"
-                onSelect={() => openTab(t("center.empty.advanced_search"), null, "search")}
-              />
-              <DropdownMenuItem
-                label={t("center.empty.graph_view")}
-                shortcut="⌘G"
-                onSelect={() => {
-                  void executePluginCommand("graph.cycle");
-                }}
-              />
-              <DropdownMenuSeparator />
-              <DropdownMenuItem
-                label={t("center.empty.settings")}
-                shortcut="⌘,"
-                onSelect={() => openSettings()}
-              />
+              <Show when={moreActionIds.includes("advanced-search")}>
+                <DropdownMenuItem
+                  label={t("center.empty.advanced_search")}
+                  shortcut="⌘U"
+                  onSelect={() => openTab(t("center.empty.advanced_search"), null, "search")}
+                />
+              </Show>
             </DropdownMenuContent>
           </DropdownMenu>
         </div>

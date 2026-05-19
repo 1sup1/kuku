@@ -7,6 +7,8 @@ export const EN_MESSAGES = {
   "settings.nav.files": "Files & Links",
   "settings.nav.keybindings": "Keybindings",
   "settings.nav.plugins": "Plugins",
+  "settings.dialog.title": "Settings",
+  "settings.dialog.close": "Close settings",
   "settings.plugin.account": "Account",
   "settings.plugin.indexer": "Indexer",
   "settings.plugin.sync": "Sync",
@@ -445,6 +447,8 @@ export const EN_MESSAGES = {
   "vault.action.quick_search": "Quick Search",
   "vault.action.new_folder": "New Folder",
   "vault.action.new_file": "New File",
+  "vault.action.switch_vault": "Switch Vault",
+  "vault.action.settings": "Settings",
   "vault.input.folder_name": "Folder name",
   "vault.input.file_name": "File name",
   "vault.context.rename": "Rename",
@@ -459,6 +463,8 @@ export const EN_MESSAGES = {
   "vault.empty.description.none": "Select your vault folder to start browsing files.",
   "vault.empty.action.working": "Working...",
   "vault.empty.action.select_vault": "Select Vault",
+  "vault.empty.action.create_demo": "Create Sample Notes",
+  "vault.empty.action.creating_demo": "Creating...",
   "vault.empty.tree": "This vault is empty.",
 
   "search.placeholder": "Search your vault",
@@ -531,10 +537,22 @@ export const EN_MESSAGES = {
   "chat.input.stop": "Stop",
   "chat.header.cancel": "Cancel",
   "chat.header.clear": "Clear Chat",
+  "chat.header.session_select": "Switch chat session",
   "chat.header.auto_accept": "Auto-approve",
   "chat.header.auto_accept.on_title":
     "Auto Accept is on. Pending approvals are accepted automatically.",
   "chat.header.auto_accept.off_title": "Auto Accept is off. Changes ask for approval first.",
+  "chat.permission.default.label": "Default",
+  "chat.permission.default.description": "Use safe workspace-scoped tools and ask before changes.",
+  "chat.permission.auto_review.label": "Auto-review",
+  "chat.permission.auto_review.description":
+    "Keep the default scope and review risky work before approval.",
+  "chat.permission.full_access.label": "Full Access",
+  "chat.permission.full_access.description":
+    "Enable broader agent workflows while keeping high-risk confirmations.",
+  "chat.permission.full_access.confirm":
+    "Full Access enables broader agent workflows. High-risk changes still require confirmation. Continue?",
+  "chat.permission.selector.disabled": "Permission selection is not wired to AI execution yet.",
   "chat.loading": "Loading",
   "chat.thinking": "Thinking",
   "chat.attachment.selected_text": "Selected text",
@@ -556,12 +574,18 @@ export const EN_MESSAGES = {
   "chat.welcome.try_asking": "Try asking",
   "chat.welcome.s1.text": "Discover hidden connections",
   "chat.welcome.s1.hint": "Find related notes & map relationships",
+  "chat.welcome.s1.prompt":
+    "Find notes related to this document and show how they connect to each other",
   "chat.welcome.s2.text": "Extract key insights",
   "chat.welcome.s2.hint": "Summarize & suggest what to explore next",
+  "chat.welcome.s2.prompt": "Summarize this document clearly and suggest follow-up questions",
   "chat.welcome.s3.text": "Synthesize new ideas",
   "chat.welcome.s3.hint": "Generate linked notes from your thoughts",
+  "chat.welcome.s3.prompt":
+    "Draft a wiki page from the source document with useful links to existing notes",
   "chat.welcome.s4.text": "Organize my vault",
   "chat.welcome.s4.hint": "Find unlinked notes & strengthen connections",
+  "chat.welcome.s4.prompt": "Review my vault and suggest specific links for unconnected notes",
 
   "tool.search_notes.label": "Search Notes",
   "tool.search_notes.active": "Searching",

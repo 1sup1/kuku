@@ -15,6 +15,7 @@ import {
   sendMessage,
   setAutoApprove,
   setDraft,
+  setPermissionPreset,
   switchMode,
 } from "../chat_store";
 import {
@@ -23,6 +24,11 @@ import {
   resolveFileMentionTrigger,
   type FileMentionTrigger,
 } from "../file_embed";
+import {
+  getPermissionPreset,
+  getPermissionPresetOptions,
+  type ChatPermissionPresetId,
+} from "../permission_presets";
 import type { ChatMode } from "../types";
 
 const MODE_OPTIONS: {
@@ -52,10 +58,13 @@ function ChatInput(): JSX.Element {
   let textareaRef: HTMLTextAreaElement | undefined;
   let fileSuggestionMenuRef: HTMLElement | undefined;
   let modeMenuRootRef: HTMLDivElement | undefined;
+  let permissionMenuRootRef: HTMLDivElement | undefined;
+  let permissionMenuRef: HTMLDivElement | undefined;
   const [draft, setLocalDraft] = createSignal("");
   const [fileMention, setFileMention] = createSignal<FileMentionTrigger | null>(null);
   const [fileMentionIndex, setFileMentionIndex] = createSignal(0);
   const [showModeMenu, setShowModeMenu] = createSignal(false);
+  const [showPermissionMenu, setShowPermissionMenu] = createSignal(false);
 
   const session = () =>
     chatState.activeSessionId ? (chatState.sessions[chatState.activeSessionId] ?? null) : null;
@@ -68,6 +77,13 @@ function ChatInput(): JSX.Element {
   const autoApproveEnabled = () => session()?.autoApprove ?? false;
   const canShowAutoApprove = () =>
     chatState.selectedMode === "agent" || chatState.selectedMode === "inline";
+  const permissionPresetsEnabled = () => false;
+  const permissionOptions = () => getPermissionPresetOptions(t);
+  const selectedPermissionOption = () =>
+    !permissionPresetsEnabled()
+      ? permissionOptions()[0]
+      : (permissionOptions().find((option) => option.id === chatState.permissionPreset) ??
+        permissionOptions()[0]);
   const fileSuggestions = createMemo(() => {
     const mention = fileMention();
     if (!mention) return [];
@@ -106,15 +122,23 @@ function ChatInput(): JSX.Element {
 
   /** Close mode menu on outside press or Escape. */
   createEffect(() => {
-    if (!showModeMenu()) return;
+    if (!showModeMenu() && !showPermissionMenu()) return;
     const onPointerDown = (e: PointerEvent) => {
-      if (modeMenuRootRef == null) return;
-      if (!modeMenuRootRef.contains(e.target as Node)) {
+      const target = e.target as Node;
+      if (modeMenuRootRef != null && !modeMenuRootRef.contains(target)) {
         setShowModeMenu(false);
+      }
+      if (permissionMenuRootRef != null && !permissionMenuRootRef.contains(target)) {
+        if (permissionMenuRef == null || !permissionMenuRef.contains(target)) {
+          setShowPermissionMenu(false);
+        }
       }
     };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setShowModeMenu(false);
+      if (e.key === "Escape") {
+        setShowModeMenu(false);
+        setShowPermissionMenu(false);
+      }
     };
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("keydown", onKeyDown, true);
@@ -138,6 +162,17 @@ function ChatInput(): JSX.Element {
     const sessionId = await ensureSession();
     if (!sessionId) return;
     setAutoApprove(sessionId, checked);
+  }
+
+  function selectPermissionPreset(presetId: ChatPermissionPresetId): void {
+    const preset = getPermissionPreset(presetId);
+    if (preset.requiresConfirmation) {
+      const confirmAccess = globalThis.confirm?.(t("chat.permission.full_access.confirm")) ?? true;
+      if (!confirmAccess) return;
+    }
+
+    setPermissionPreset(presetId);
+    setShowPermissionMenu(false);
   }
 
   function handleKeyDown(e: KeyboardEvent): void {
@@ -306,6 +341,30 @@ function ChatInput(): JSX.Element {
         </div>
       </Show>
 
+      <Show when={permissionPresetsEnabled() && showPermissionMenu()}>
+        <div
+          ref={(el) => (permissionMenuRef = el)}
+          data-kuku-permission-menu="true"
+          class="absolute right-2 bottom-11 left-2 z-50 overflow-hidden rounded-sm border border-border bg-bg-elevated py-1 shadow-popover sm:right-2.5 sm:left-2.5"
+        >
+          <For each={permissionOptions()}>
+            {(option) => (
+              <button
+                type="button"
+                class="flex w-full flex-col items-start gap-0.5 p-2.5 text-left transition hover:bg-ghost-hover"
+                classList={{
+                  "bg-ghost-hover": chatState.permissionPreset === option.id,
+                }}
+                onClick={() => selectPermissionPreset(option.id)}
+              >
+                <span class="text-[0.8125rem] font-medium text-text-primary">{option.label}</span>
+                <span class="text-xs/snug text-text-muted">{option.description}</span>
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+
       <div
         class="px-2 py-1.5 sm:px-2.5"
         classList={{ "pointer-events-none opacity-50": isLocked() }}
@@ -353,7 +412,7 @@ function ChatInput(): JSX.Element {
         />
 
         <div class="mt-0.5 flex min-h-8 items-center justify-between gap-2 border-t border-border/50 pt-1.5">
-          <div class="flex min-w-0 items-center gap-2.5">
+          <div class="flex min-w-0 items-center gap-2">
             <div class="relative" ref={(el) => (modeMenuRootRef = el)}>
               <button
                 type="button"
@@ -400,6 +459,31 @@ function ChatInput(): JSX.Element {
                   </For>
                 </div>
               </Show>
+            </div>
+            <div class="relative" ref={(el) => (permissionMenuRootRef = el)}>
+              <button
+                type="button"
+                data-kuku-permission-preset-trigger="true"
+                disabled
+                class="inline-flex min-h-7 -translate-y-px cursor-not-allowed items-center gap-1 rounded-sm px-1.5 py-1 text-[0.75rem] font-medium text-text-muted/60 opacity-70"
+                title={t("chat.permission.selector.disabled")}
+              >
+                <span class="max-w-24 truncate sm:max-w-none">
+                  {selectedPermissionOption().label}
+                </span>
+                <svg
+                  class="shrink-0 translate-y-px text-text-muted"
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  aria-hidden="true"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
             </div>
           </div>
 

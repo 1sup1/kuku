@@ -8,7 +8,11 @@ use std::{collections::HashMap, sync::Arc};
 use parking_lot::RwLock;
 
 pub use context::ToolCallContext;
-pub use descriptor::{ToolAccess, ToolDescriptor, ToolSource, allowed_tools};
+#[cfg(test)]
+pub use descriptor::allowed_tools;
+pub use descriptor::{
+    ToolAccess, ToolCatalog, ToolDescriptor, ToolKind, ToolRiskLevel, ToolSource,
+};
 pub use native::{AiNativeTool, NativeToolResult};
 pub use proxy::{ProxyBroker, ProxyToolDescriptor, ProxyToolResult};
 
@@ -29,10 +33,12 @@ impl ToolRegistry {
         self.native.read().get(name).cloned()
     }
 
-    pub fn register_proxy(&self, descriptor: ProxyToolDescriptor) {
+    pub fn register_proxy(&self, descriptor: ProxyToolDescriptor) -> Result<(), crate::AiError> {
+        descriptor.validate()?;
         self.proxy
             .write()
             .insert(descriptor.name.clone(), descriptor);
+        Ok(())
     }
 
     pub fn unregister_proxy(&self, name: &str) {
