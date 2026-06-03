@@ -109,12 +109,9 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-/** Pixel overhead from resize handles (1px) + panel borders (1px) per open side panel. */
+/** Side resize boundaries are overlays, so they do not consume layout width. */
 function horizontalChrome(): number {
-  let px = 0;
-  if (layoutState.leftPanelOpen) px += 2; // border-r + handle
-  if (layoutState.rightPanelOpen) px += 2; // handle + border-l
-  return px;
+  return 0;
 }
 
 /**

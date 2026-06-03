@@ -3,13 +3,12 @@ import { Dynamic } from "solid-js/web";
 
 import MarkdownEditor from "~/components/editor/markdown_editor";
 import { KukuLogo } from "~/components/icons/kuku_logo";
-import TabBar from "~/components/layout/tab_bar";
 import { t } from "~/i18n";
 import { pluginsReady } from "~/plugins/bootstrap";
 import { createFocusZone } from "~/plugins/focus_zone";
 import { getCenterTabFill, PluginErrorUI, PluginSkeleton } from "~/plugins/slots";
 import { openSearchOmnibar } from "~/plugins/builtin/search/omnibar_state";
-import { filesState, getActiveTab, openSettings, openTab } from "~/stores/files";
+import { filesState, getActiveTab, openSettings } from "~/stores/files";
 import { openRightPanelView, toggleLeftPanel } from "~/stores/layout";
 import { createAndOpenNewFile, vaultState } from "~/stores/vault";
 
@@ -17,6 +16,7 @@ import { createAndOpenNewFile, vaultState } from "~/stores/vault";
 
 export default function CenterPanel() {
   const activeTab = () => getActiveTab();
+  const showEmptyState = () => filesState.tabs.length === 0 || activeTab()?.type === "placeholder";
   const pluginTabType = () => activeTab()?.type ?? null;
   const editorTab = () => {
     const tab = activeTab();
@@ -47,9 +47,8 @@ export default function CenterPanel() {
       ref={(el) => onCleanup(createFocusZone(el, "center"))}
       class="flex min-w-[30%] flex-1 flex-col overflow-hidden bg-bg-primary"
     >
-      <TabBar />
       <Show
-        when={filesState.tabs.length > 0}
+        when={!showEmptyState()}
         fallback={
           <div class="min-h-0 flex-1 overflow-y-hidden">
             <div class="flex min-h-full flex-col items-center justify-center gap-4 p-4">
@@ -127,7 +126,7 @@ export default function CenterPanel() {
                 <button
                   type="button"
                   class="flex w-full cursor-pointer items-center justify-between rounded-xs border-none bg-transparent px-3 py-2.5 transition-all duration-150 hover:bg-bg-secondary active:scale-[0.98]"
-                  onClick={() => openTab(t("center.empty.advanced_search"), null, "search")}
+                  onClick={() => openSearchOmnibar("regex")}
                 >
                   <span class="text-[0.8125rem] text-text-muted">
                     {t("center.empty.advanced_search")}

@@ -2,7 +2,12 @@ import { type JSX, Show } from "solid-js";
 
 import { layoutState } from "~/stores/layout";
 
-// ── No-drag style for interactive regions ──
+// ── Window drag styles ──
+
+const DRAG = {
+  "-webkit-app-region": "drag",
+  "app-region": "drag",
+} as Record<string, string>;
 
 const NO_DRAG = {
   "-webkit-app-region": "no-drag",
@@ -14,7 +19,7 @@ const NO_DRAG = {
 interface TitleBarProps {
   /** Content for the left region (after traffic-light spacer) */
   left?: JSX.Element;
-  /** Content for the center region */
+  /** Main inline title-bar content between the left and right regions */
   center?: JSX.Element;
   /** Content for the right region */
   right?: JSX.Element;
@@ -33,7 +38,7 @@ interface TitleBarProps {
  * ```tsx
  * <TitleBar
  *   left={<SidebarToggle />}
- *   center={<SearchInput />}
+ *   center={<TabBar />}
  *   right={<SettingsButton />}
  * />
  * ```
@@ -41,39 +46,64 @@ interface TitleBarProps {
 export default function TitleBar(props: TitleBarProps) {
   return (
     <header
-      class={`relative flex h-8.5 shrink-0 items-center border-b border-border bg-bg-secondary px-2 select-none ${props.class ?? ""}`}
-      style={
-        {
-          "-webkit-app-region": "drag",
-          "app-region": "drag",
-        } as Record<string, string>
-      }
+      class={`relative flex h-8.5 shrink-0 items-center bg-bg-secondary select-none ${props.class ?? ""}`}
+      style={DRAG}
       data-tauri-drag-region
     >
-      {/* ── macOS traffic-light spacer (hidden in fullscreen) ── */}
-      <Show when={!layoutState.isFullscreen}>
-        <div class="pointer-events-none w-18 shrink-0" style={NO_DRAG} />
-      </Show>
-
-      {/* ── Left region ── */}
-      <div class="flex shrink-0 items-center gap-1 px-3" style={NO_DRAG}>
-        {props.left}
+      {/* ── Center region ── */}
+      <div
+        class="absolute inset-0 z-10 flex h-full min-w-0 items-stretch"
+        style={DRAG}
+        data-tauri-drag-region
+      >
+        {props.center}
       </div>
 
-      {/* ── Spacer (pushes right region to the end) ── */}
-      <div class="flex-1" />
-
-      {/* ── Center region (absolute for true center) ── */}
+      {/* ── Left region ── */}
       <div
-        class="pointer-events-none absolute inset-x-0 flex items-center justify-center"
-        style={NO_DRAG}
+        class="absolute inset-y-0 left-0 z-20 flex items-center px-1"
+        style={DRAG}
+        data-kuku-titlebar-left-hit-area="true"
+        data-tauri-drag-region
       >
-        <div class="pointer-events-auto">{props.center}</div>
+        <span
+          data-kuku-titlebar-left-bottom-divider="true"
+          class="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border"
+          classList={{ hidden: layoutState.leftPanelOpen }}
+          aria-hidden="true"
+        />
+        {/* macOS traffic-light spacer (hidden in fullscreen) */}
+        <Show when={!layoutState.isFullscreen}>
+          <div class="pointer-events-none w-18 shrink-0" />
+        </Show>
+        <div
+          class="flex shrink-0 items-center gap-1 px-1"
+          style={NO_DRAG}
+          data-kuku-titlebar-left-controls="true"
+        >
+          {props.left}
+        </div>
       </div>
 
       {/* ── Right region ── */}
-      <div class="flex shrink-0 items-center gap-1 px-3" style={NO_DRAG}>
-        {props.right}
+      <div
+        class="absolute inset-y-0 right-0 z-20 flex items-center justify-end bg-bg-secondary px-1"
+        style={DRAG}
+        data-kuku-titlebar-right-hit-area="true"
+        data-tauri-drag-region
+      >
+        <span
+          data-kuku-titlebar-right-bottom-divider="true"
+          class="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border"
+          aria-hidden="true"
+        />
+        <div
+          class="flex shrink-0 items-center gap-1 px-1"
+          style={NO_DRAG}
+          data-kuku-titlebar-right-controls="true"
+        >
+          {props.right}
+        </div>
       </div>
     </header>
   );

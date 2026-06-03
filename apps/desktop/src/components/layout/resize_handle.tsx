@@ -17,6 +17,7 @@ interface ResizeHandleProps {
 
 export default function ResizeHandle(props: ResizeHandleProps) {
   const [active, setActive] = createSignal(false);
+  const [hovered, setHovered] = createSignal(false);
   const isCol = () => props.direction === "col";
 
   let teardown: (() => void) | null = null;
@@ -55,6 +56,14 @@ export default function ResizeHandle(props: ResizeHandleProps) {
     document.addEventListener("pointercancel", cleanup);
   }
 
+  function onPointerEnter() {
+    setHovered(true);
+  }
+
+  function onPointerLeave() {
+    setHovered(false);
+  }
+
   return (
     <div
       classList={{
@@ -76,12 +85,17 @@ export default function ResizeHandle(props: ResizeHandleProps) {
       />
       <div
         onPointerDown={onPointerDown}
+        onPointerEnter={onPointerEnter}
+        onPointerLeave={onPointerLeave}
+        data-hovered={hovered() && !active() ? "" : undefined}
         classList={{
           "relative z-10 shrink-0 before:absolute before:z-20 before:content-['']": true,
           "h-full w-px cursor-col-resize before:-inset-x-0.5 before:inset-y-0": isCol(),
           "h-px w-full cursor-row-resize before:inset-x-0 before:-inset-y-0.5": !isCol(),
-          "bg-border hover:bg-border/80": !active(),
-          "bg-transparent": active(),
+          "kuku-resize-line-hit kuku-resize-line-hit--col": isCol(),
+          "kuku-resize-line-hit kuku-resize-line-hit--row": !isCol(),
+          "bg-border": !active() && !hovered(),
+          "bg-transparent": active() || hovered(),
         }}
       />
     </div>

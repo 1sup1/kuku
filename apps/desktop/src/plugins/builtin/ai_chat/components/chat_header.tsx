@@ -1,108 +1,117 @@
-import { For, Show, type JSX } from "solid-js";
+import { Show, type JSX } from "solid-js";
 
 import {
-  cancelSession,
   chatState,
-  createSession,
+  closeSession,
   getSessionSummaries,
-  getActiveSession,
   isSessionBusy,
-  switchSession,
 } from "../chat_store";
-import type { ChatSessionState } from "../types";
-import { getSessionStatusMeta, type ChatUiTone } from "../ui_state";
+import { AgentSessionMenu } from "./agent_session_menu";
+import { ChatSessionMenu } from "./chat_session_menu";
+import type { ChatSessionState, ChatSessionSummary } from "../types";
 import { t } from "~/i18n";
-
-const STATUS_TONE_CLASSES: Record<ChatUiTone, string> = {
-  neutral: "text-text-muted",
-  accent: "text-info",
-  warning: "text-warning",
-  danger: "text-error",
-  success: "text-success",
-} as const;
 
 function ChatHeader(): JSX.Element {
   const session = (): ChatSessionState | null => {
     const id = chatState.activeSessionId;
     return id ? (chatState.sessions[id] ?? null) : null;
   };
-  const statusMeta = () => getSessionStatusMeta(session());
-  const canCancel = () => isSessionBusy(session());
   const sessionSummaries = () => getSessionSummaries();
+  const activeSessionSummary = (): ChatSessionSummary | null => {
+    const active = session();
+    if (!active) return null;
+    return {
+      id: active.id,
+      agentId: active.agentId,
+      mode: active.mode,
+      title: active.persistedTitle?.trim() || fallbackSessionTitle(active),
+      draft: active.draft,
+      messageCount: active.messages.length,
+      status: active.status,
+      isActive: true,
+      updatedAt: active.updatedAt,
+    };
+  };
+  const visibleSessionSummaries = () => {
+    const summaries = sessionSummaries();
+    const active = activeSessionSummary();
+    if (summaries.length > 0 || !active) return summaries;
+    return [active];
+  };
 
   return (
     <div class="flex h-10 shrink-0 items-center justify-between border-b border-border bg-bg-primary px-3">
-      {/* Left: status */}
-      <div class="flex min-w-0 items-center gap-2">
-        <span class="size-1.5 shrink-0 rounded-full bg-text-muted/30" aria-hidden="true" />
-        <span
-          class={`text-[0.6875rem] font-medium tracking-wide ${STATUS_TONE_CLASSES[statusMeta().tone]}`}
+      <div class="flex min-w-0 items-center">
+        <div
+          class="flex min-w-0 items-center gap-1"
+          data-kuku-session-controls="true"
         >
-          {statusMeta().label}
-        </span>
-        <Show when={sessionSummaries().length > 1}>
-          <select
-            class="hover:border-border-strong ml-1 h-7 max-w-[11rem] rounded-md border border-border bg-bg-secondary px-2 text-[0.6875rem] text-text-secondary transition outline-none focus:border-accent"
-            value={chatState.activeSessionId ?? ""}
-            title={t("chat.header.session_select")}
-            aria-label={t("chat.header.session_select")}
-            onChange={(event) => {
-              switchSession(event.currentTarget.value);
-            }}
+          <div
+            class="flex min-w-0 items-center gap-1"
+            data-kuku-session-primary-controls="true"
           >
-            <For each={sessionSummaries()}>
-              {(item) => (
-                <option value={item.id}>
-                  {item.title} ({item.messageCount})
-                </option>
-              )}
-            </For>
-          </select>
-        </Show>
-      </div>
+            <Show when={visibleSessionSummaries().length > 0}>
+              <ChatSessionMenu
+                items={visibleSessionSummaries()}
+                activeSessionId={chatState.activeSessionId}
+              />
+            </Show>
 
-      {/* Right: actions */}
-      <div class="flex items-center gap-0.5">
-        <Show when={canCancel()}>
-          <button
-            type="button"
-            class="flex size-8 items-center justify-center rounded-md text-text-muted transition hover:bg-ghost-hover hover:text-text-primary"
-            title={t("chat.header.cancel")}
-            onClick={() => void cancelSession()}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none">
-              <rect x="4" y="4" width="16" height="16" rx="2" />
-            </svg>
-          </button>
-        </Show>
+            <AgentSessionMenu align={visibleSessionSummaries().length > 0 ? "right" : "left"} />
+          </div>
 
-        <button
-          type="button"
-          class="flex size-8 items-center justify-center rounded-md text-text-muted transition enabled:hover:bg-ghost-hover enabled:hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
-          title={t("chat.header.clear")}
-          disabled={chatState.isCreatingSession || isSessionBusy(session())}
-          onClick={() => {
-            const active = getActiveSession();
-            if (!active) return;
-            void createSession(chatState.selectedMode);
-          }}
-        >
-          <svg
-            width="14"
-            height="14"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path d="M3 6h18" />
-            <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
-            <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
-          </svg>
-        </button>
+          <Show when={session()}>
+            <div
+              class="ml-0.5 flex items-center border-l border-border pl-1"
+              data-kuku-session-close-controls="true"
+            >
+              <button
+                type="button"
+                data-kuku-close-chat-session="true"
+                class="flex size-7 shrink-0 items-center justify-center rounded-md text-text-muted transition enabled:hover:bg-ghost-hover enabled:hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-40"
+                title={t("chat.header.close_session")}
+                aria-label={t("chat.header.close_session")}
+                disabled={isSessionBusy(session())}
+                onClick={() => void closeSession()}
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                >
+                  <path d="M6 6l12 12" />
+                  <path d="M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+          </Show>
+        </div>
       </div>
     </div>
   );
+}
+
+function fallbackSessionTitle(session: ChatSessionState): string {
+  const firstUserMessage = session.messages.find(
+    (message) => message.kind === "text" && message.role === "user",
+  );
+  const title = firstUserMessage?.content.trim();
+  if (title) {
+    return title.length > 64 ? `${title.slice(0, 61)}...` : title;
+  }
+
+  switch (session.mode) {
+    case "agent":
+      return "Agent session";
+    case "inline":
+      return "Inline session";
+    case "ask":
+      return "Ask session";
+  }
 }
 
 export { ChatHeader };

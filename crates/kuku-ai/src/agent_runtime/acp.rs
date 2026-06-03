@@ -1,0 +1,1854 @@
+use std::{
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use agent_client_protocol::{
+    ActiveSession, Agent, ByteStreams, Client, ConnectTo, ConnectionTo,
+    schema::{
+        CancelNotification, ContentBlock, ContentChunk, EnvVariable, InitializeRequest,
+        InitializeResponse, LoadSessionRequest, LoadSessionResponse, McpServer, McpServerStdio,
+        NewSessionResponse, ProtocolVersion, ResumeSessionRequest, ResumeSessionResponse,
+        SessionId, SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallContent,
+        ToolCallStatus,
+    },
+    util::MatchDispatch,
+};
+use async_trait::async_trait;
+use serde_json::Value;
+use tauri::{AppHandle, Wry};
+use tokio::{
+    process::{Child, ChildStderr, ChildStdin, ChildStdout},
+    sync::{Mutex, oneshot, watch},
+    time::{Duration, timeout},
+};
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use uuid::Uuid;
+
+use crate::{
+    AiError, AiState, NewSessionPayload, ToolDescriptor,
+    agent_runtime::{
+        AgentNewSessionRequest, AgentRestoreSessionRequest, AgentRuntime, AgentSendMessageRequest,
+        events::{emit_done, emit_error, emit_stream_chunk, emit_tool_end, emit_tool_start},
+    },
+    mcp_bridge::{
+        SharedChatMode, SharedEditorContext, allowed_mcp_tool_descriptors, kuku_mcp_server,
+    },
+    prompts::build_system_prompt,
+    types::{EditorContext, ExternalAgentConfig, FinishReason, ModelToolCall},
+};
+
+const ACP_SESSION_READY_TIMEOUT: Duration = Duration::from_secs(30);
+const CODEX_ACP_AGENT_ID: &str = "codex-acp";
+const CODEX_ACP_COMMAND: &str = "npx";
+const CODEX_ACP_PACKAGE: &str = "@zed-industries/codex-acp@latest";
+
+#[derive(Debug, Clone)]
+struct AcpAgentCommand {
+    command: String,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AcpAgentRuntime {
+    command: AcpAgentCommand,
+}
+
+#[derive(Debug)]
+struct AcpAgentProcess {
+    agent: AcpAgent,
+    working_directory: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct AcpAgent {
+    server: McpServer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AcpAgentProcessSpec {
+    command: PathBuf,
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    working_directory: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AcpRestoreStrategy {
+    Resume,
+    Load,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AcpSessionCapabilities {
+    pub(crate) supports_load: bool,
+    pub(crate) supports_resume: bool,
+    pub(crate) supports_mcp_http: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AcpSessionHandle {
+    session: Option<Arc<Mutex<ActiveSession<'static, Agent>>>>,
+    connection: Option<ConnectionTo<Agent>>,
+    session_id: Option<SessionId>,
+    capabilities: AcpSessionCapabilities,
+    editor_context: SharedEditorContext,
+    current_mode: SharedChatMode,
+    shutdown: watch::Sender<bool>,
+}
+
+impl AcpAgentRuntime {
+    fn new(command: AcpAgentCommand) -> Self {
+        Self { command }
+    }
+
+    pub(crate) fn managed(agent_id: &str) -> Option<Self> {
+        let command = match agent_id {
+            CODEX_ACP_AGENT_ID if command_available(CODEX_ACP_COMMAND) => {
+                AcpAgentCommand::codex([])
+            }
+            _ => return None,
+        };
+        Some(Self::new(command))
+    }
+
+    pub(crate) fn configured(config: &ExternalAgentConfig) -> Result<Self, AiError> {
+        if config.id != CODEX_ACP_AGENT_ID {
+            return Err(AiError::UnknownAgent(config.id.clone()));
+        }
+        if !command_available(CODEX_ACP_COMMAND) {
+            return Err(AiError::AgentUnavailable(config.id.clone()));
+        }
+        Ok(Self::new(AcpAgentCommand::from_config(config)))
+    }
+
+    pub(crate) fn config_available(config: &ExternalAgentConfig) -> bool {
+        config.id == CODEX_ACP_AGENT_ID && command_available(CODEX_ACP_COMMAND)
+    }
+
+    pub(crate) fn is_known_managed(agent_id: &str) -> bool {
+        agent_id == CODEX_ACP_AGENT_ID
+    }
+
+    pub(crate) fn is_available(agent_id: &str) -> bool {
+        Self::managed(agent_id).is_some()
+    }
+
+    fn acp_agent(&self) -> Result<AcpAgent, AiError> {
+        if self.command.env.is_empty()
+            && self.command.command == CODEX_ACP_COMMAND
+            && self.command.args == ["-y", CODEX_ACP_PACKAGE]
+        {
+            return Ok(AcpAgent::zed_codex());
+        }
+
+        AcpAgent::from_args(self.command_line_args()).map_err(acp_error)
+    }
+
+    fn initialize_request(&self) -> InitializeRequest {
+        InitializeRequest::new(ProtocolVersion::LATEST)
+    }
+
+    fn command_summary(&self) -> String {
+        let args = if self.command.args.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", self.command.args.join(" "))
+        };
+        let env_summary = if self.command.env.is_empty() {
+            String::new()
+        } else {
+            format!(" with {} env vars", self.command.env.len())
+        };
+        format!("{}{}{}", self.command.command, args, env_summary)
+    }
+
+    fn command_line_args(&self) -> Vec<String> {
+        self.command
+            .env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .chain(std::iter::once(self.command.command.clone()))
+            .chain(self.command.args.clone())
+            .collect()
+    }
+
+    fn prepare_send_message(
+        &self,
+        state: &AiState,
+        request: &AgentSendMessageRequest,
+    ) -> Result<AcpSessionHandle, AiError> {
+        state.get_acp_session(&request.session_id)
+    }
+}
+
+impl AcpAgentProcess {
+    fn new(agent: AcpAgent, working_directory: Option<PathBuf>) -> Self {
+        Self {
+            agent,
+            working_directory,
+        }
+    }
+}
+
+impl AcpAgent {
+    fn zed_codex() -> Self {
+        Self::from_args(["npx", "-y", CODEX_ACP_PACKAGE]).expect("valid codex ACP command")
+    }
+
+    fn from_args<I, T>(args: I) -> Result<Self, agent_client_protocol::Error>
+    where
+        I: IntoIterator<Item = T>,
+        T: ToString,
+    {
+        let args = args
+            .into_iter()
+            .map(|arg| arg.to_string())
+            .collect::<Vec<_>>();
+        if args.is_empty() {
+            return Err(agent_client_protocol::util::internal_error(
+                "Arguments cannot be empty",
+            ));
+        }
+
+        let mut env = Vec::new();
+        let mut command_index = 0;
+        for (index, arg) in args.iter().enumerate() {
+            if let Some((name, value)) = parse_env_var(arg) {
+                env.push(EnvVariable::new(name, value));
+                command_index = index + 1;
+            } else {
+                break;
+            }
+        }
+
+        if command_index >= args.len() {
+            return Err(agent_client_protocol::util::internal_error(
+                "No command found (only environment variables provided)",
+            ));
+        }
+
+        let command = PathBuf::from(&args[command_index]);
+        let command_args = args[command_index + 1..].to_vec();
+        let name = command
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("agent")
+            .to_string();
+        Ok(Self {
+            server: McpServer::Stdio(
+                McpServerStdio::new(name, command)
+                    .args(command_args)
+                    .env(env),
+            ),
+        })
+    }
+
+    fn server(&self) -> &McpServer {
+        &self.server
+    }
+}
+
+fn parse_env_var(value: &str) -> Option<(String, String)> {
+    let eq_pos = value.find('=')?;
+    if eq_pos == 0 {
+        return None;
+    }
+
+    let name = &value[..eq_pos];
+    let env_value = &value[eq_pos + 1..];
+    let mut chars = name.chars();
+    let first = chars.next()?;
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+
+    Some((name.to_string(), env_value.to_string()))
+}
+
+impl ConnectTo<Client> for AcpAgentProcess {
+    async fn connect_to(
+        self,
+        client: impl ConnectTo<Agent>,
+    ) -> Result<(), agent_client_protocol::Error> {
+        let spec = acp_agent_process_spec(&self.agent, self.working_directory)?;
+        let (child_stdin, child_stdout, child_stderr, child) = spawn_acp_agent_process(spec)?;
+        let stderr_rx = collect_child_stderr(child_stderr);
+        let child_monitor = monitor_child(child, stderr_rx);
+        let protocol = ConnectTo::<Client>::connect_to(
+            ByteStreams::new(child_stdin.compat_write(), child_stdout.compat()),
+            client,
+        );
+
+        tokio::select! {
+            result = protocol => result,
+            result = child_monitor => result,
+        }
+    }
+}
+
+fn acp_agent_process_spec(
+    agent: &AcpAgent,
+    working_directory: Option<PathBuf>,
+) -> Result<AcpAgentProcessSpec, agent_client_protocol::Error> {
+    let McpServer::Stdio(stdio) = agent.server() else {
+        return Err(agent_client_protocol::util::internal_error(
+            "Only stdio ACP agents are supported",
+        ));
+    };
+
+    Ok(AcpAgentProcessSpec {
+        command: stdio.command.clone(),
+        args: stdio.args.clone(),
+        env: stdio
+            .env
+            .iter()
+            .map(|env| (env.name.clone(), env.value.clone()))
+            .collect(),
+        working_directory,
+    })
+}
+
+fn spawn_acp_agent_process(
+    spec: AcpAgentProcessSpec,
+) -> Result<(ChildStdin, ChildStdout, ChildStderr, Child), agent_client_protocol::Error> {
+    let mut cmd = tokio::process::Command::new(&spec.command);
+    cmd.args(&spec.args);
+    for (name, value) in &spec.env {
+        cmd.env(name, value);
+    }
+    if let Some(working_directory) = &spec.working_directory {
+        cmd.current_dir(working_directory);
+    }
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(agent_client_protocol::Error::into_internal_error)?;
+    let child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| agent_client_protocol::util::internal_error("Failed to open ACP stdin"))?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| agent_client_protocol::util::internal_error("Failed to open ACP stdout"))?;
+    let child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| agent_client_protocol::util::internal_error("Failed to open ACP stderr"))?;
+
+    Ok((child_stdin, child_stdout, child_stderr, child))
+}
+
+fn collect_child_stderr(child_stderr: ChildStderr) -> oneshot::Receiver<String> {
+    let (stderr_tx, stderr_rx) = oneshot::channel::<String>();
+    tokio::spawn(async move {
+        use futures::{AsyncBufReadExt, StreamExt, io::BufReader};
+
+        let stderr_reader = BufReader::new(child_stderr.compat());
+        let mut stderr_lines = stderr_reader.lines();
+        let mut collected = String::new();
+        while let Some(line_result) = stderr_lines.next().await {
+            if let Ok(line) = line_result {
+                if !collected.is_empty() {
+                    collected.push('\n');
+                }
+                collected.push_str(&line);
+            }
+        }
+        let _ = stderr_tx.send(collected);
+    });
+    stderr_rx
+}
+
+struct AcpChildGuard(Child);
+
+impl AcpChildGuard {
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.0.wait().await
+    }
+}
+
+impl Drop for AcpChildGuard {
+    fn drop(&mut self) {
+        drop(self.0.start_kill());
+    }
+}
+
+async fn monitor_child(
+    child: Child,
+    stderr_rx: oneshot::Receiver<String>,
+) -> Result<(), agent_client_protocol::Error> {
+    let mut guard = AcpChildGuard(child);
+    let status = guard.wait().await.map_err(|error| {
+        agent_client_protocol::util::internal_error(format!(
+            "Failed to wait for ACP process: {error}"
+        ))
+    })?;
+
+    if status.success() {
+        return Ok(());
+    }
+
+    let stderr = stderr_rx.await.unwrap_or_default();
+    let message = if stderr.is_empty() {
+        format!("ACP process exited with {status}")
+    } else {
+        format!("ACP process exited with {status}: {stderr}")
+    };
+    Err(agent_client_protocol::util::internal_error(message))
+}
+
+impl AcpSessionCapabilities {
+    pub(crate) fn from_initialize_response(response: &InitializeResponse) -> Self {
+        Self {
+            supports_load: response.agent_capabilities.load_session,
+            supports_mcp_http: response.agent_capabilities.mcp_capabilities.http,
+            supports_resume: response
+                .agent_capabilities
+                .session_capabilities
+                .resume
+                .is_some(),
+        }
+    }
+}
+
+impl AcpSessionHandle {
+    fn live(
+        session: ActiveSession<'static, Agent>,
+        capabilities: AcpSessionCapabilities,
+        editor_context: SharedEditorContext,
+        current_mode: SharedChatMode,
+        shutdown: watch::Sender<bool>,
+    ) -> Self {
+        let connection = session.connection();
+        let session_id = session.session_id().clone();
+        Self {
+            session: Some(Arc::new(Mutex::new(session))),
+            connection: Some(connection),
+            session_id: Some(session_id),
+            capabilities,
+            editor_context,
+            current_mode,
+            shutdown,
+        }
+    }
+
+    #[cfg(test)]
+    fn disconnected_for_test(session_id: &str) -> Self {
+        Self::with_capabilities_for_test(session_id, AcpSessionCapabilities::default())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_capabilities_for_test(
+        session_id: &str,
+        capabilities: AcpSessionCapabilities,
+    ) -> Self {
+        let (shutdown, _rx) = watch::channel(false);
+        Self {
+            session: None,
+            connection: None,
+            session_id: Some(SessionId::new(session_id)),
+            capabilities,
+            editor_context: Arc::new(parking_lot::RwLock::new(EditorContext::default())),
+            current_mode: Arc::new(parking_lot::RwLock::new(crate::ChatMode::Ask)),
+            shutdown,
+        }
+    }
+
+    #[cfg(test)]
+    fn current_mode_for_test(&self) -> crate::ChatMode {
+        self.current_mode.read().clone()
+    }
+
+    #[cfg(test)]
+    fn set_current_mode_for_test(&self, mode: crate::ChatMode) {
+        *self.current_mode.write() = mode;
+    }
+
+    pub(crate) fn request_shutdown(&self) {
+        let _ = self.shutdown.send(true);
+    }
+
+    async fn cancel(&self) -> Result<(), AiError> {
+        let (Some(connection), Some(session_id)) =
+            (self.connection.as_ref(), self.session_id.as_ref())
+        else {
+            return Ok(());
+        };
+        connection
+            .send_notification(CancelNotification::new(session_id.clone()))
+            .map_err(acp_error)
+    }
+
+    pub(crate) fn external_session_id(&self) -> Option<String> {
+        self.session_id.as_ref().map(ToString::to_string)
+    }
+
+    pub(crate) fn capabilities(&self) -> AcpSessionCapabilities {
+        self.capabilities
+    }
+
+    async fn send_prompt_and_stream(
+        &self,
+        app: AppHandle<Wry>,
+        state: AiState,
+        request: AgentSendMessageRequest,
+    ) -> Result<FinishReason, AiError> {
+        let Some(session) = self.session.as_ref() else {
+            return Err(AiError::ProviderError(format!(
+                "ACP session {} is not connected",
+                request.session_id
+            )));
+        };
+        *self.editor_context.write() = request.editor_context.clone();
+        *self.current_mode.write() = request.mode.clone();
+        let allowed_tools = if self.capabilities.supports_mcp_http {
+            allowed_mcp_tool_descriptors(&state, request.mode.clone())
+        } else {
+            Vec::new()
+        };
+        let mut session = session.lock().await;
+        session
+            .send_prompt(build_acp_prompt_text(&request, &allowed_tools))
+            .map_err(acp_error)?;
+
+        loop {
+            match session.read_update().await.map_err(acp_error)? {
+                agent_client_protocol::SessionMessage::SessionMessage(dispatch) => {
+                    emit_acp_dispatch_update(&app, &request.session_id, dispatch).await?;
+                }
+                agent_client_protocol::SessionMessage::StopReason(reason) => {
+                    return Ok(acp_stop_reason_to_finish_reason(&reason));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+async fn emit_acp_dispatch_update(
+    app: &AppHandle<Wry>,
+    session_id: &str,
+    dispatch: agent_client_protocol::Dispatch,
+) -> Result<(), AiError> {
+    MatchDispatch::new(dispatch)
+        .if_notification(async |notification: SessionNotification| {
+            match notification.update {
+                SessionUpdate::AgentMessageChunk(chunk)
+                | SessionUpdate::AgentThoughtChunk(chunk) => {
+                    if let Some(delta) = acp_chunk_text_delta(chunk) {
+                        emit_stream_chunk(app, session_id, delta);
+                    }
+                }
+                SessionUpdate::ToolCall(tool_call) => {
+                    let (model_call, tool_id) = acp_tool_call_start(&tool_call);
+                    emit_tool_start(app, session_id, &model_call, &tool_id);
+                    if matches!(
+                        tool_call.status,
+                        ToolCallStatus::Completed | ToolCallStatus::Failed
+                    ) {
+                        let output = acp_tool_call_output(
+                            tool_call.raw_output.as_ref(),
+                            Some(&tool_call.content),
+                        );
+                        emit_tool_end(
+                            app,
+                            session_id,
+                            &model_call.call_id,
+                            &tool_id,
+                            &model_call.tool_name,
+                            &output,
+                            matches!(tool_call.status, ToolCallStatus::Failed),
+                        );
+                    }
+                }
+                SessionUpdate::ToolCallUpdate(update) => {
+                    if matches!(
+                        update.fields.status,
+                        Some(ToolCallStatus::Completed | ToolCallStatus::Failed)
+                    ) {
+                        let call_id = update.tool_call_id.0.to_string();
+                        let tool_name = update.fields.title.as_deref().unwrap_or("ACP tool");
+                        let tool_id = acp_tool_id(&call_id);
+                        let output = acp_tool_call_output(
+                            update.fields.raw_output.as_ref(),
+                            update.fields.content.as_ref(),
+                        );
+                        emit_tool_end(
+                            app,
+                            session_id,
+                            &call_id,
+                            &tool_id,
+                            tool_name,
+                            &output,
+                            matches!(update.fields.status, Some(ToolCallStatus::Failed)),
+                        );
+                    }
+                }
+                SessionUpdate::Plan(plan) => {
+                    let summary = plan
+                        .entries
+                        .iter()
+                        .map(|entry| format!("- {:?}: {}", entry.status, entry.content))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !summary.is_empty() {
+                        emit_stream_chunk(app, session_id, format!("\n\nPlan:\n{summary}\n"));
+                    }
+                }
+                SessionUpdate::UserMessageChunk(_)
+                | SessionUpdate::AvailableCommandsUpdate(_)
+                | SessionUpdate::CurrentModeUpdate(_)
+                | SessionUpdate::ConfigOptionUpdate(_)
+                | SessionUpdate::SessionInfoUpdate(_) => {}
+                _ => {}
+            }
+            Ok(())
+        })
+        .await
+        .otherwise_ignore()
+        .map_err(acp_error)?;
+    Ok(())
+}
+
+fn acp_chunk_text_delta(chunk: ContentChunk) -> Option<String> {
+    match chunk.content {
+        ContentBlock::Text(text) => Some(acp_text_delta_to_kuku_delta(text.text)),
+        _ => None,
+    }
+}
+
+fn acp_tool_call_start(tool_call: &ToolCall) -> (ModelToolCall, String) {
+    let call_id = tool_call.tool_call_id.0.to_string();
+    let tool_id = acp_tool_id(&call_id);
+    (
+        ModelToolCall {
+            call_id,
+            tool_call_id: None,
+            provider_call_id: None,
+            tool_name: tool_call.title.clone(),
+            arguments: tool_call.raw_input.clone().unwrap_or(Value::Null),
+            signature: None,
+        },
+        tool_id,
+    )
+}
+
+fn acp_tool_id(call_id: &str) -> String {
+    format!("acp.{call_id}")
+}
+
+fn acp_tool_call_output(
+    raw_output: Option<&Value>,
+    content: Option<&Vec<ToolCallContent>>,
+) -> String {
+    if let Some(raw_output) = raw_output {
+        return raw_output.to_string();
+    }
+    let Some(content) = content else {
+        return String::new();
+    };
+    content
+        .iter()
+        .filter_map(|item| match item {
+            ToolCallContent::Content(content) => match &content.content {
+                ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            },
+            ToolCallContent::Diff(diff) => Some(format!("{diff:?}")),
+            ToolCallContent::Terminal(terminal) => Some(format!("{terminal:?}")),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn acp_stop_reason_to_finish_reason(reason: &StopReason) -> FinishReason {
+    match reason {
+        StopReason::Cancelled => FinishReason::Cancelled,
+        _ => FinishReason::Stop,
+    }
+}
+
+fn acp_text_delta_to_kuku_delta(text: impl Into<String>) -> String {
+    text.into()
+}
+
+async fn initialize_acp_connection(
+    connection: &ConnectionTo<Agent>,
+) -> Result<AcpSessionCapabilities, agent_client_protocol::Error> {
+    let initialize = connection
+        .send_request(InitializeRequest::new(ProtocolVersion::LATEST))
+        .block_task()
+        .await?;
+    Ok(AcpSessionCapabilities::from_initialize_response(
+        &initialize,
+    ))
+}
+
+async fn start_new_acp_session(
+    connection: &ConnectionTo<Agent>,
+    app: AppHandle<Wry>,
+    state: AiState,
+    local_session_id: String,
+    working_directory: Option<PathBuf>,
+    capabilities: AcpSessionCapabilities,
+    editor_context: SharedEditorContext,
+    current_mode: SharedChatMode,
+) -> Result<ActiveSession<'static, Agent>, agent_client_protocol::Error> {
+    let cwd = acp_working_directory(working_directory.as_deref())?;
+    if capabilities.supports_mcp_http {
+        connection
+            .build_session(cwd)
+            .with_mcp_server(kuku_mcp_server(
+                app,
+                state,
+                local_session_id,
+                editor_context,
+                current_mode,
+            ))?
+            .block_task()
+            .start_session()
+            .await
+    } else {
+        connection
+            .build_session(cwd)
+            .block_task()
+            .start_session()
+            .await
+    }
+}
+
+async fn attach_resumed_acp_session(
+    connection: &ConnectionTo<Agent>,
+    external_session_id: impl Into<SessionId>,
+    working_directory: Option<PathBuf>,
+) -> Result<ActiveSession<'static, Agent>, agent_client_protocol::Error> {
+    let external_session_id = external_session_id.into();
+    let cwd = acp_working_directory(working_directory.as_deref())?;
+    let resume = connection
+        .send_request(ResumeSessionRequest::new(external_session_id.clone(), cwd))
+        .block_task()
+        .await?;
+    let response = new_session_response_from_resume(external_session_id, resume);
+    // agent-client-protocol exposes MCP attachment only through
+    // SessionBuilder::with_mcp_server for new sessions. Resume/load already
+    // returns a response, so there is no public hook to create and retain the
+    // per-session MCP handler registration here.
+    connection.attach_session(response, Vec::new())
+}
+
+async fn attach_loaded_acp_session(
+    connection: &ConnectionTo<Agent>,
+    external_session_id: impl Into<SessionId>,
+    working_directory: Option<PathBuf>,
+) -> Result<ActiveSession<'static, Agent>, agent_client_protocol::Error> {
+    let external_session_id = external_session_id.into();
+    let cwd = acp_working_directory(working_directory.as_deref())?;
+    let load = connection
+        .send_request(LoadSessionRequest::new(external_session_id.clone(), cwd))
+        .block_task()
+        .await?;
+    let response = new_session_response_from_load(external_session_id, load);
+    // See attach_resumed_acp_session: ACP has no public restore/load MCP
+    // attachment hook after the response has already been returned.
+    connection.attach_session(response, Vec::new())
+}
+
+fn new_session_response_from_resume(
+    session_id: impl Into<SessionId>,
+    resume: ResumeSessionResponse,
+) -> NewSessionResponse {
+    NewSessionResponse::new(session_id)
+        .modes(resume.modes)
+        .config_options(resume.config_options)
+        .meta(resume.meta)
+}
+
+fn new_session_response_from_load(
+    session_id: impl Into<SessionId>,
+    load: LoadSessionResponse,
+) -> NewSessionResponse {
+    NewSessionResponse::new(session_id)
+        .modes(load.modes)
+        .config_options(load.config_options)
+        .meta(load.meta)
+}
+
+fn acp_restore_strategy(
+    capabilities: AcpSessionCapabilities,
+    command_summary: &str,
+) -> Result<AcpRestoreStrategy, AiError> {
+    if capabilities.supports_resume {
+        return Ok(AcpRestoreStrategy::Resume);
+    }
+    if capabilities.supports_load {
+        return Ok(AcpRestoreStrategy::Load);
+    }
+    Err(AiError::ProviderError(format!(
+        "ACP agent {command_summary} supports neither session resume nor session load"
+    )))
+}
+
+fn acp_working_directory(explicit: Option<&Path>) -> Result<PathBuf, agent_client_protocol::Error> {
+    if let Some(explicit) = explicit {
+        return Ok(explicit.to_path_buf());
+    }
+    env::current_dir().map_err(|error| {
+        agent_client_protocol::Error::internal_error()
+            .data(format!("cannot get current directory: {error}"))
+    })
+}
+
+async fn wait_for_acp_shutdown(shutdown_rx: &mut watch::Receiver<bool>) {
+    while !*shutdown_rx.borrow() {
+        if shutdown_rx.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
+fn build_acp_prompt_text(
+    request: &AgentSendMessageRequest,
+    allowed_tools: &[ToolDescriptor],
+) -> String {
+    let mut prompt = String::from("--- Kuku system instructions ---\n");
+    prompt.push_str(&build_system_prompt(request.mode.clone(), allowed_tools));
+    prompt.push_str("\n\n--- USER MESSAGE ---\n");
+    prompt.push_str(&request.content);
+    let context = &request.editor_context;
+    let has_context = context.active_file.is_some()
+        || context.selected_text.is_some()
+        || !context.open_tabs.is_empty()
+        || context.cursor_line.is_some()
+        || !context.embedded_files.is_empty();
+    if !has_context {
+        return prompt;
+    }
+
+    prompt.push_str("\n\n--- Kuku editor context ---");
+    if let Some(active_file) = context.active_file.as_deref() {
+        prompt.push_str("\nActive file: ");
+        prompt.push_str(active_file);
+    }
+    if let Some(cursor_line) = context.cursor_line {
+        prompt.push_str("\nCursor line: ");
+        prompt.push_str(&cursor_line.to_string());
+    }
+    if !context.open_tabs.is_empty() {
+        prompt.push_str("\nOpen tabs: ");
+        prompt.push_str(&context.open_tabs.join(", "));
+    }
+    if let Some(selected_text) = context.selected_text.as_deref() {
+        prompt.push_str("\n\nSelected text");
+        if let Some(active_file) = context.active_file.as_deref() {
+            prompt.push_str(" from ");
+            prompt.push_str(active_file);
+        }
+        prompt.push_str(":\n");
+        push_context_block(&mut prompt, selected_text);
+    }
+    for file in &context.embedded_files {
+        prompt.push_str("\n\nEmbedded file: ");
+        prompt.push_str(&file.path);
+        prompt.push_str(" (");
+        prompt.push_str(&file.size_bytes.to_string());
+        prompt.push_str(" bytes, checksum ");
+        prompt.push_str(&file.checksum);
+        prompt.push_str(")\n");
+        push_context_block(&mut prompt, &file.content);
+    }
+    prompt
+}
+
+fn push_context_block(prompt: &mut String, content: &str) {
+    prompt.push_str("JSON string content:\n");
+    prompt.push_str(&serde_json::to_string(content).unwrap_or_else(|_| "\"\"".to_string()));
+}
+
+fn command_available(command: &str) -> bool {
+    find_command_for_spawn(command).is_some()
+}
+
+fn find_command_for_spawn(command: &str) -> Option<String> {
+    find_command_for_spawn_with(command, env::var_os("PATH"), dirs::home_dir().as_deref())
+}
+
+fn find_command_for_spawn_with(
+    command: &str,
+    path_var: Option<OsString>,
+    home_dir: Option<&Path>,
+) -> Option<String> {
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file().then(|| command.to_string());
+    }
+
+    if let Some(paths) = path_var {
+        if env::split_paths(&paths).any(|dir| dir.join(command).is_file()) {
+            return Some(command.to_string());
+        }
+    }
+
+    common_node_command_path(command, home_dir).map(|path| path.to_string_lossy().into_owned())
+}
+
+fn common_node_command_path(command: &str, home_dir: Option<&Path>) -> Option<PathBuf> {
+    if command != "npx" {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+
+    if let Some(home) = home_dir {
+        candidates.extend([
+            home.join(".volta").join("bin").join(command),
+            home.join(".asdf").join("shims").join(command),
+            home.join(".local")
+                .join("share")
+                .join("mise")
+                .join("shims")
+                .join(command),
+        ]);
+
+        let nvm_versions = home.join(".nvm").join("versions").join("node");
+        if let Ok(entries) = std::fs::read_dir(nvm_versions) {
+            let mut nvm_candidates = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path().join("bin").join(command))
+                .collect::<Vec<_>>();
+            nvm_candidates.sort();
+            nvm_candidates.reverse();
+            candidates.extend(nvm_candidates);
+        }
+    }
+
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin").join(command),
+        PathBuf::from("/usr/local/bin").join(command),
+        PathBuf::from("/usr/bin").join(command),
+    ]);
+
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+impl AcpAgentCommand {
+    fn codex(env: impl IntoIterator<Item = (String, String)>) -> Self {
+        let mut env = env.into_iter().collect::<Vec<_>>();
+        env.sort_by(|left, right| left.0.cmp(&right.0));
+        Self {
+            command: find_command_for_spawn(CODEX_ACP_COMMAND)
+                .unwrap_or_else(|| CODEX_ACP_COMMAND.to_string()),
+            args: vec!["-y".to_string(), CODEX_ACP_PACKAGE.to_string()],
+            env,
+        }
+    }
+
+    fn from_config(config: &ExternalAgentConfig) -> Self {
+        let env: Vec<(String, String)> = config
+            .env
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Self::codex(env)
+    }
+}
+
+fn acp_error(error: agent_client_protocol::Error) -> AiError {
+    AiError::ProviderError(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_client_protocol::schema::{
+        AgentCapabilities, Content, ContentBlock, InitializeResponse, LoadSessionResponse,
+        McpCapabilities, ProtocolVersion, ResumeSessionResponse, SessionCapabilities,
+        SessionConfigOption, SessionConfigSelectOption, SessionModeState, SessionNotification,
+        SessionResumeCapabilities, StopReason, TextContent, ToolCall, ToolCallContent,
+        ToolCallStatus,
+    };
+
+    use std::{path::PathBuf, time::Duration};
+
+    use tokio::sync::oneshot;
+
+    use crate::{
+        AiError, AiState, ChatMode, EditorContext, EmbeddedFileContext, FinishReason, ToolAccess,
+        ToolDescriptor, ToolKind, ToolRiskLevel, ToolSource,
+    };
+
+    use super::{
+        super::{AgentRuntime, AgentSendMessageRequest},
+        AcpAgentCommand, AcpAgentProcessSpec, AcpAgentRuntime, AcpRestoreStrategy,
+        AcpSessionCapabilities, AcpSessionHandle, acp_agent_process_spec, acp_restore_strategy,
+        acp_stop_reason_to_finish_reason, acp_text_delta_to_kuku_delta, acp_tool_call_output,
+        acp_tool_call_start, acp_working_directory, await_ready_session, build_acp_prompt_text,
+        new_session_response_from_load, new_session_response_from_resume, spawn_acp_agent_process,
+    };
+
+    fn command() -> AcpAgentCommand {
+        AcpAgentCommand {
+            command: "test-acp".to_string(),
+            args: vec!["--stdio".to_string()],
+            env: vec![("CODEX_HOME".to_string(), "/tmp/codex".to_string())],
+        }
+    }
+
+    fn prompt_tool(name: &str, access: ToolAccess) -> ToolDescriptor {
+        ToolDescriptor {
+            tool_id: format!("builtin.{name}"),
+            name: name.to_string(),
+            description: format!("{name} tool"),
+            parameters: serde_json::json!({ "type": "object" }),
+            category: "test".to_string(),
+            kind: ToolKind::Other,
+            requires_approval: access == ToolAccess::ProposesMutation,
+            risk_level: ToolRiskLevel::Low,
+            mode_availability: vec![ChatMode::Ask, ChatMode::Inline, ChatMode::Agent],
+            permission_rule_key: format!("builtin.{name}"),
+            access,
+            source: ToolSource::Native,
+        }
+    }
+
+    #[test]
+    fn acp_agent_runtime_constructor_preserves_command_data() {
+        let command = command();
+
+        let runtime = AcpAgentRuntime::new(command.clone());
+
+        assert_eq!(runtime.command.command, command.command);
+        assert_eq!(runtime.command.args, command.args);
+        assert_eq!(runtime.command.env, command.env);
+    }
+
+    #[test]
+    fn acp_agent_runtime_compile_checks_acp_initialize_request() {
+        let runtime = AcpAgentRuntime::new(command());
+
+        let initialize = runtime.initialize_request();
+
+        assert_eq!(initialize.protocol_version, ProtocolVersion::LATEST);
+    }
+
+    #[test]
+    fn managed_external_agent_ids_create_acp_runtimes() {
+        let runtime = AcpAgentRuntime::managed("codex-acp").expect("codex should be managed");
+
+        assert_eq!(runtime.command.command, "npx");
+        assert_eq!(
+            runtime.command.args,
+            vec!["-y", "@zed-industries/codex-acp@latest"]
+        );
+        assert!(AcpAgentRuntime::managed("unknown").is_none());
+    }
+
+    #[test]
+    fn configured_non_codex_agent_is_rejected() {
+        use std::collections::HashMap;
+
+        use crate::types::ExternalAgentConfig;
+
+        let error = AcpAgentRuntime::configured(&ExternalAgentConfig {
+            id: "custom-acp".to_string(),
+            label: "Custom ACP".to_string(),
+            command: "node".to_string(),
+            args: vec!["agent.js".to_string(), "--stdio".to_string()],
+            env: HashMap::from([("CUSTOM_TOKEN".to_string(), "secret".to_string())]),
+            enabled: true,
+        })
+        .expect_err("non-Codex ACP agents should be rejected");
+
+        assert!(matches!(error, AiError::UnknownAgent(_)));
+    }
+
+    #[test]
+    fn configured_codex_default_command_uses_zed_codex_package_and_preserves_env() {
+        use std::collections::HashMap;
+
+        use crate::types::ExternalAgentConfig;
+
+        let runtime = AcpAgentRuntime::configured(&ExternalAgentConfig {
+            id: "codex-acp".to_string(),
+            label: "Codex CLI".to_string(),
+            command: "node".to_string(),
+            args: vec!["not-codex.js".to_string()],
+            env: HashMap::from([("OPENAI_API_KEY".to_string(), "secret".to_string())]),
+            enabled: true,
+        })
+        .expect("configured runtime");
+
+        assert_eq!(
+            runtime.command_line_args(),
+            vec![
+                "OPENAI_API_KEY=secret",
+                "npx",
+                "-y",
+                "@zed-industries/codex-acp@latest"
+            ]
+        );
+
+        let agent = runtime.acp_agent().expect("acp agent");
+        let agent_client_protocol::schema::McpServer::Stdio(stdio) = agent.server() else {
+            panic!("configured Codex ACP should use stdio");
+        };
+        assert_eq!(stdio.command, std::path::PathBuf::from("npx"));
+        assert_eq!(
+            stdio.args,
+            vec![
+                "-y".to_string(),
+                "@zed-industries/codex-acp@latest".to_string()
+            ]
+        );
+        assert_eq!(
+            stdio
+                .env
+                .iter()
+                .map(|env| (env.name.as_str(), env.value.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("OPENAI_API_KEY", "secret")]
+        );
+    }
+
+    #[test]
+    fn managed_codex_runtime_uses_zed_codex_agent_command() {
+        let runtime = AcpAgentRuntime::managed("codex-acp").expect("codex should be managed");
+        let agent = runtime.acp_agent().unwrap();
+        let agent_client_protocol::schema::McpServer::Stdio(stdio) = agent.server() else {
+            panic!("Codex ACP should use stdio");
+        };
+
+        assert_eq!(stdio.command, std::path::PathBuf::from("npx"));
+        assert_eq!(
+            stdio.args,
+            vec![
+                "-y".to_string(),
+                "@zed-industries/codex-acp@latest".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn acp_agent_process_spec_uses_explicit_working_directory() {
+        let runtime = AcpAgentRuntime::managed("codex-acp").expect("codex should be managed");
+        let agent = runtime.acp_agent().unwrap();
+
+        let spec = acp_agent_process_spec(&agent, Some(PathBuf::from("/Users/me/Notes")))
+            .expect("process spec");
+
+        assert_eq!(
+            spec.working_directory,
+            Some(PathBuf::from("/Users/me/Notes"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_acp_agent_process_uses_working_directory() {
+        use tokio::io::AsyncReadExt;
+
+        let working_directory =
+            std::env::temp_dir().join(format!("kuku-acp-cwd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&working_directory).expect("create working directory");
+        let expected_directory = working_directory
+            .canonicalize()
+            .expect("canonical working directory");
+
+        let spec = AcpAgentProcessSpec {
+            command: PathBuf::from("/bin/pwd"),
+            args: Vec::new(),
+            env: Vec::new(),
+            working_directory: Some(working_directory.clone()),
+        };
+
+        let (child_stdin, mut child_stdout, child_stderr, mut child) =
+            spawn_acp_agent_process(spec).expect("spawn pwd");
+        drop(child_stdin);
+        drop(child_stderr);
+
+        let mut stdout = String::new();
+        child_stdout
+            .read_to_string(&mut stdout)
+            .await
+            .expect("read stdout");
+        let status = child.wait().await.expect("wait for pwd");
+        let _ = std::fs::remove_dir_all(&working_directory);
+
+        assert!(status.success());
+        assert_eq!(PathBuf::from(stdout.trim_end()), expected_directory);
+    }
+
+    #[test]
+    fn codex_command_resolution_falls_back_to_nvm_when_path_misses_npx() {
+        let home = std::env::temp_dir().join(format!("kuku-ai-nvm-test-{}", uuid::Uuid::new_v4()));
+        let npx = home
+            .join(".nvm")
+            .join("versions")
+            .join("node")
+            .join("v24.15.0")
+            .join("bin")
+            .join("npx");
+        std::fs::create_dir_all(npx.parent().expect("npx parent")).unwrap();
+        std::fs::write(&npx, "").unwrap();
+
+        let resolved =
+            super::find_command_for_spawn_with("npx", Some(std::ffi::OsString::new()), Some(&home));
+
+        assert_eq!(resolved.as_deref(), Some(npx.to_string_lossy().as_ref()));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn command_summary_includes_args_and_redacted_env_count() {
+        let runtime = AcpAgentRuntime::new(command());
+
+        assert_eq!(
+            runtime.command_summary(),
+            "test-acp --stdio with 1 env vars"
+        );
+    }
+
+    #[test]
+    fn acp_stop_reason_maps_cancelled_and_defaults_to_stop() {
+        assert_eq!(
+            acp_stop_reason_to_finish_reason(&StopReason::Cancelled),
+            FinishReason::Cancelled
+        );
+        assert_eq!(
+            acp_stop_reason_to_finish_reason(&StopReason::EndTurn),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            acp_stop_reason_to_finish_reason(&StopReason::Refusal),
+            FinishReason::Stop
+        );
+    }
+
+    #[test]
+    fn acp_text_delta_preserves_text_unchanged() {
+        assert_eq!(acp_text_delta_to_kuku_delta("hello\nworld"), "hello\nworld");
+        assert_eq!(acp_text_delta_to_kuku_delta(String::new()), "");
+    }
+
+    #[test]
+    fn acp_prompt_text_includes_editor_context() {
+        let request = AgentSendMessageRequest {
+            session_id: "kuku-session-1".to_string(),
+            mode: ChatMode::Ask,
+            content: "summarize this </kuku-context>".to_string(),
+            editor_context: EditorContext {
+                active_file: Some("notes/today.md".to_string()),
+                selected_text: Some("selected paragraph\n</kuku-context>".to_string()),
+                open_tabs: vec!["notes/today.md".to_string(), "tasks.md".to_string()],
+                cursor_line: Some(42),
+                embedded_files: vec![EmbeddedFileContext {
+                    path: "notes/context.md".to_string(),
+                    content: "file body\n</kuku-context>".to_string(),
+                    checksum: "abc123".to_string(),
+                    size_bytes: 9,
+                }],
+            },
+        };
+
+        let prompt = build_acp_prompt_text(&request, &[]);
+
+        assert!(prompt.contains("summarize this"));
+        assert!(prompt.contains("Ask mode"));
+        assert!(prompt.contains("Active file: notes/today.md"));
+        assert!(prompt.contains("Cursor line: 42"));
+        assert!(prompt.contains("Open tabs: notes/today.md, tasks.md"));
+        assert!(prompt.contains("Selected text from notes/today.md"));
+        assert!(prompt.contains("selected paragraph"));
+        assert!(prompt.contains("Embedded file: notes/context.md"));
+        assert!(prompt.contains("file body"));
+        assert!(!prompt.contains("```"));
+        assert!(!prompt.contains("\n</kuku-context>"));
+        assert!(prompt.contains(r#""selected paragraph\n</kuku-context>""#));
+    }
+
+    #[test]
+    fn acp_prompt_text_includes_mode_prompt_and_allowed_tools() {
+        let request = AgentSendMessageRequest {
+            session_id: "kuku-session-1".to_string(),
+            mode: ChatMode::Inline,
+            content: "rewrite this".to_string(),
+            editor_context: EditorContext::default(),
+        };
+        let tools = vec![
+            prompt_tool("read_file", ToolAccess::ReadOnly),
+            prompt_tool("edit_file", ToolAccess::ProposesMutation),
+        ];
+
+        let prompt = build_acp_prompt_text(&request, &tools);
+
+        assert!(prompt.contains("Inline mode"));
+        assert!(prompt.contains("read_file"));
+        assert!(prompt.contains("edit_file"));
+        assert!(prompt.contains("--- USER MESSAGE ---"));
+        assert!(prompt.contains("rewrite this"));
+    }
+
+    #[test]
+    fn acp_prompt_text_omits_tools_not_allowed_for_current_mode() {
+        let request = AgentSendMessageRequest {
+            session_id: "kuku-session-1".to_string(),
+            mode: ChatMode::Ask,
+            content: "what changed?".to_string(),
+            editor_context: EditorContext::default(),
+        };
+
+        let prompt =
+            build_acp_prompt_text(&request, &[prompt_tool("read_file", ToolAccess::ReadOnly)]);
+
+        assert!(prompt.contains("Ask mode"));
+        assert!(prompt.contains("read_file"));
+        assert!(!prompt.contains("create_file"));
+    }
+
+    #[test]
+    fn acp_session_handle_tracks_current_mode_for_mcp_tools() {
+        let handle = AcpSessionHandle::with_capabilities_for_test(
+            "external-acp-session-1",
+            AcpSessionCapabilities::default(),
+        );
+
+        assert_eq!(handle.current_mode_for_test(), ChatMode::Ask);
+
+        handle.set_current_mode_for_test(ChatMode::Agent);
+
+        assert_eq!(handle.current_mode_for_test(), ChatMode::Agent);
+    }
+
+    #[test]
+    fn acp_tool_call_start_maps_to_kuku_tool_start_payload_data() {
+        let tool_call = ToolCall::new("tool-1", "Read file")
+            .status(ToolCallStatus::InProgress)
+            .raw_input(serde_json::json!({ "path": "README.md" }));
+
+        let (model_call, tool_id) = acp_tool_call_start(&tool_call);
+
+        assert_eq!(model_call.call_id, "tool-1");
+        assert_eq!(model_call.tool_name, "Read file");
+        assert_eq!(
+            model_call.arguments,
+            serde_json::json!({ "path": "README.md" })
+        );
+        assert_eq!(tool_id, "acp.tool-1");
+    }
+
+    #[test]
+    fn acp_tool_call_output_prefers_raw_output_and_falls_back_to_text_content() {
+        assert_eq!(
+            acp_tool_call_output(Some(&serde_json::json!({ "ok": true })), None),
+            r#"{"ok":true}"#
+        );
+
+        let content = vec![ToolCallContent::Content(Content::new(ContentBlock::Text(
+            TextContent::new("tool text"),
+        )))];
+
+        assert_eq!(acp_tool_call_output(None, Some(&content)), "tool text");
+    }
+
+    #[tokio::test]
+    async fn acp_agent_runtime_cancel_and_close_report_missing_sessions() {
+        let state = AiState::default();
+        let runtime = AcpAgentRuntime::new(command());
+
+        let cancel_error = runtime.cancel(&state, "session-1").await.unwrap_err();
+        let close_error = runtime
+            .close_session(&state, "session-1")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(cancel_error, AiError::SessionNotFound));
+        assert!(matches!(close_error, AiError::SessionNotFound));
+    }
+
+    #[test]
+    fn acp_session_store_inserts_gets_and_removes_handles() {
+        let state = AiState::default();
+        let handle = AcpSessionHandle::disconnected_for_test("acp-session-1");
+
+        assert!(
+            state
+                .insert_acp_session("kuku-session-1".to_string(), handle.clone())
+                .is_ok()
+        );
+        assert!(
+            state
+                .insert_acp_session("kuku-session-1".to_string(), handle)
+                .is_err()
+        );
+
+        assert!(state.get_acp_session("kuku-session-1").is_ok());
+        assert_eq!(state.acp_session_count(), 1);
+        assert!(state.remove_acp_session("kuku-session-1").is_ok());
+        assert!(state.get_acp_session("kuku-session-1").is_err());
+        assert_eq!(state.acp_session_count(), 0);
+    }
+
+    #[test]
+    fn acp_initialize_response_maps_load_session_capability() {
+        let response = InitializeResponse::new(ProtocolVersion::LATEST).agent_capabilities(
+            AgentCapabilities::new()
+                .load_session(true)
+                .mcp_capabilities(McpCapabilities::new().http(true)),
+        );
+
+        let capabilities = AcpSessionCapabilities::from_initialize_response(&response);
+
+        assert!(capabilities.supports_load);
+        assert!(!capabilities.supports_resume);
+        assert!(capabilities.supports_mcp_http);
+    }
+
+    #[test]
+    fn acp_initialize_response_maps_resume_capability() {
+        let response = InitializeResponse::new(ProtocolVersion::LATEST).agent_capabilities(
+            AgentCapabilities::new().session_capabilities(
+                SessionCapabilities::new().resume(SessionResumeCapabilities::new()),
+            ),
+        );
+
+        let capabilities = AcpSessionCapabilities::from_initialize_response(&response);
+
+        assert!(capabilities.supports_resume);
+    }
+
+    #[test]
+    fn acp_resume_response_maps_to_attachable_session_response() {
+        let mut meta = serde_json::Map::new();
+        meta.insert("provider".to_string(), serde_json::json!("codex-acp"));
+        let modes = SessionModeState::new("ask", vec![]);
+        let config_options = vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5",
+            vec![SessionConfigSelectOption::new("gpt-5", "GPT-5")],
+        )];
+        let resume = ResumeSessionResponse::new()
+            .modes(modes.clone())
+            .config_options(config_options.clone())
+            .meta(meta.clone());
+
+        let response = new_session_response_from_resume("acp-session-1", resume);
+
+        assert_eq!(response.session_id.to_string(), "acp-session-1");
+        assert_eq!(response.modes, Some(modes));
+        assert_eq!(response.config_options, Some(config_options));
+        assert_eq!(response.meta, Some(meta));
+    }
+
+    #[test]
+    fn acp_load_response_maps_to_attachable_session_response() {
+        let mut meta = serde_json::Map::new();
+        meta.insert("provider".to_string(), serde_json::json!("codex-acp"));
+        let modes = SessionModeState::new("ask", vec![]);
+        let config_options = vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "gpt-5",
+            vec![SessionConfigSelectOption::new("gpt-5", "GPT-5")],
+        )];
+        let load = LoadSessionResponse::new()
+            .modes(modes.clone())
+            .config_options(config_options.clone())
+            .meta(meta.clone());
+
+        let response = new_session_response_from_load("acp-session-1", load);
+
+        assert_eq!(response.session_id.to_string(), "acp-session-1");
+        assert_eq!(response.modes, Some(modes));
+        assert_eq!(response.config_options, Some(config_options));
+        assert_eq!(response.meta, Some(meta));
+    }
+
+    #[test]
+    fn acp_restore_strategy_uses_load_when_resume_is_not_supported() {
+        let strategy = acp_restore_strategy(
+            AcpSessionCapabilities {
+                supports_load: true,
+                supports_resume: false,
+                supports_mcp_http: false,
+            },
+            "codex-acp",
+        )
+        .expect("load fallback");
+
+        assert_eq!(strategy, AcpRestoreStrategy::Load);
+    }
+
+    #[test]
+    fn acp_restore_strategy_prefers_resume_when_supported() {
+        let strategy = acp_restore_strategy(
+            AcpSessionCapabilities {
+                supports_load: true,
+                supports_resume: true,
+                supports_mcp_http: false,
+            },
+            "codex-acp",
+        )
+        .expect("resume strategy");
+
+        assert_eq!(strategy, AcpRestoreStrategy::Resume);
+    }
+
+    #[test]
+    fn acp_restore_strategy_rejects_agents_without_restore_capability() {
+        let error = acp_restore_strategy(AcpSessionCapabilities::default(), "test-acp")
+            .expect_err("restore should be unsupported");
+
+        assert!(
+            error
+                .to_string()
+                .contains("supports neither session resume nor session load")
+        );
+    }
+
+    #[test]
+    fn acp_working_directory_prefers_explicit_vault_root() {
+        let cwd = acp_working_directory(Some(PathBuf::from("/Users/me/Notes").as_path()))
+            .expect("working directory");
+
+        assert_eq!(cwd, PathBuf::from("/Users/me/Notes"));
+    }
+
+    #[test]
+    fn acp_session_notification_accepts_codex_usage_updates() {
+        let payload = serde_json::json!({
+            "sessionId": "acp-session-1",
+            "update": {
+                "sessionUpdate": "usage_update",
+                "size": 258400,
+                "used": 20226
+            }
+        });
+
+        let parsed = serde_json::from_value::<SessionNotification>(payload);
+
+        assert!(
+            parsed.is_ok(),
+            "Codex ACP usage_update notifications must not terminate the session: {parsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_send_message_for_unknown_session_returns_session_not_found() {
+        let runtime = AcpAgentRuntime::managed("codex-acp").expect("codex should be managed");
+        let request = AgentSendMessageRequest {
+            session_id: "missing-session".to_string(),
+            mode: ChatMode::Ask,
+            content: "hello".to_string(),
+            editor_context: Default::default(),
+        };
+
+        let error = runtime
+            .prepare_send_message(&AiState::default(), &request)
+            .unwrap_err();
+
+        assert!(matches!(error, AiError::SessionNotFound));
+    }
+
+    #[tokio::test]
+    async fn acp_ready_wait_times_out_when_agent_never_reports_session() {
+        let (_sender, receiver) = oneshot::channel::<Result<String, AiError>>();
+
+        let error = await_ready_session(
+            receiver,
+            "stuck-agent".to_string(),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(error.to_string().contains("stuck-agent"));
+    }
+}
+
+#[async_trait]
+impl AgentRuntime for AcpAgentRuntime {
+    async fn new_session(
+        &self,
+        app: AppHandle<Wry>,
+        state: &AiState,
+        request: AgentNewSessionRequest,
+    ) -> Result<NewSessionPayload, AiError> {
+        let _initialize = self.initialize_request();
+        let agent = self.acp_agent()?;
+        let state = state.clone();
+        let app = app.clone();
+        let working_directory = request.working_directory.clone();
+        let initial_mode = request.mode.clone();
+        let command_summary = self.command_summary();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<String, AiError>>();
+        let ready_tx = Arc::new(std::sync::Mutex::new(Some(ready_tx)));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let shutdown_for_handle = shutdown_tx.clone();
+        let ready_for_task = ready_tx.clone();
+        let session_id_for_cleanup = Arc::new(std::sync::Mutex::new(None::<String>));
+        let cleanup_session_id = session_id_for_cleanup.clone();
+
+        let task = tauri::async_runtime::spawn(async move {
+            let connection_result = Client
+                .builder()
+                .name("kuku")
+                .connect_with(
+                    AcpAgentProcess::new(agent, working_directory.clone()),
+                    async |connection| {
+                        let capabilities = initialize_acp_connection(&connection).await?;
+                        let kuku_session_id = Uuid::new_v4().to_string();
+                        let editor_context =
+                            Arc::new(parking_lot::RwLock::new(EditorContext::default()));
+                        let current_mode = Arc::new(parking_lot::RwLock::new(initial_mode.clone()));
+                        let session = start_new_acp_session(
+                            &connection,
+                            app.clone(),
+                            state.clone(),
+                            kuku_session_id.clone(),
+                            working_directory.clone(),
+                            capabilities,
+                            editor_context.clone(),
+                            current_mode.clone(),
+                        )
+                        .await?;
+                        *session_id_for_cleanup.lock().expect("lock session id") =
+                            Some(kuku_session_id.clone());
+                        if let Err(error) = state.insert_acp_session(
+                            kuku_session_id.clone(),
+                            AcpSessionHandle::live(
+                                session,
+                                capabilities,
+                                editor_context,
+                                current_mode,
+                                shutdown_for_handle,
+                            ),
+                        ) {
+                            send_ready(&ready_for_task, Err(error));
+                            return Ok(());
+                        }
+                        send_ready(&ready_for_task, Ok(kuku_session_id));
+                        wait_for_acp_shutdown(&mut shutdown_rx).await;
+                        Ok(())
+                    },
+                )
+                .await;
+
+            if let Err(error) = connection_result {
+                send_ready(
+                    &ready_tx,
+                    Err(AiError::ProviderError(format!(
+                        "ACP agent {command_summary} failed: {error}"
+                    ))),
+                );
+            }
+            if let Some(session_id) = cleanup_session_id.lock().expect("lock session id").take() {
+                if let Ok(handle) = state.remove_acp_session(&session_id) {
+                    handle.request_shutdown();
+                }
+            }
+        });
+
+        let session_result =
+            await_ready_session(ready_rx, self.command_summary(), ACP_SESSION_READY_TIMEOUT).await;
+        if session_result.is_err() {
+            let _ = shutdown_tx.send(true);
+            task.abort();
+        }
+        let session_id = session_result?;
+        Ok(NewSessionPayload { session_id })
+    }
+
+    async fn send_message(
+        &self,
+        app: AppHandle<Wry>,
+        state: AiState,
+        request: AgentSendMessageRequest,
+    ) -> Result<(), AiError> {
+        let handle = self.prepare_send_message(&state, &request)?;
+        tauri::async_runtime::spawn(async move {
+            let finish_reason = match handle
+                .send_prompt_and_stream(app.clone(), state.clone(), request.clone())
+                .await
+            {
+                Ok(finish_reason) => finish_reason,
+                Err(error) => {
+                    emit_error(&app, &request.session_id, &error);
+                    FinishReason::Error
+                }
+            };
+            if !matches!(finish_reason, FinishReason::Cancelled | FinishReason::Error) {
+                if let Err(error) =
+                    state.touch_agent_session(&request.session_id, request.title_candidate())
+                {
+                    log::warn!("failed to persist AI session metadata: {error}");
+                }
+            }
+            emit_done(&app, &request.session_id, finish_reason, None);
+        });
+        Ok(())
+    }
+
+    async fn restore_session(
+        &self,
+        _app: AppHandle<Wry>,
+        state: &AiState,
+        request: AgentRestoreSessionRequest,
+    ) -> Result<NewSessionPayload, AiError> {
+        if state.get_acp_session(&request.session_id).is_ok() {
+            return Ok(NewSessionPayload {
+                session_id: request.session_id,
+            });
+        }
+
+        let external_session_id = request.external_session_id.clone().ok_or_else(|| {
+            AiError::ProviderError(format!(
+                "ACP session {} cannot be restored without an external session id",
+                request.session_id
+            ))
+        })?;
+        let agent = self.acp_agent()?;
+        let state = state.clone();
+        let command_summary = self.command_summary();
+        let local_session_id = request.session_id.clone();
+        let working_directory = request.working_directory.clone();
+        let initial_mode = request.mode.clone();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<String, AiError>>();
+        let ready_tx = Arc::new(std::sync::Mutex::new(Some(ready_tx)));
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let shutdown_for_handle = shutdown_tx.clone();
+        let ready_for_task = ready_tx.clone();
+        let cleanup_session_id = Arc::new(std::sync::Mutex::new(None::<String>));
+        let cleanup_session_id_for_task = cleanup_session_id.clone();
+        let task = tauri::async_runtime::spawn(async move {
+            let connection_result = Client
+                .builder()
+                .name("kuku")
+                .connect_with(
+                    AcpAgentProcess::new(agent, working_directory.clone()),
+                    async |connection| {
+                        let capabilities = initialize_acp_connection(&connection).await?;
+                        let restore_strategy =
+                            match acp_restore_strategy(capabilities, &command_summary) {
+                                Ok(strategy) => strategy,
+                                Err(error) => {
+                                    send_ready(&ready_for_task, Err(error));
+                                    return Ok(());
+                                }
+                            };
+                        let editor_context =
+                            Arc::new(parking_lot::RwLock::new(EditorContext::default()));
+                        let current_mode = Arc::new(parking_lot::RwLock::new(initial_mode.clone()));
+
+                        let session = match restore_strategy {
+                            AcpRestoreStrategy::Resume => {
+                                attach_resumed_acp_session(
+                                    &connection,
+                                    external_session_id.clone(),
+                                    working_directory.clone(),
+                                )
+                                .await?
+                            }
+                            AcpRestoreStrategy::Load => {
+                                attach_loaded_acp_session(
+                                    &connection,
+                                    external_session_id.clone(),
+                                    working_directory.clone(),
+                                )
+                                .await?
+                            }
+                        };
+
+                        if let Err(error) = state.insert_acp_session(
+                            local_session_id.clone(),
+                            AcpSessionHandle::live(
+                                session,
+                                capabilities,
+                                editor_context,
+                                current_mode,
+                                shutdown_for_handle,
+                            ),
+                        ) {
+                            send_ready(&ready_for_task, Err(error));
+                            return Ok(());
+                        }
+                        *cleanup_session_id_for_task.lock().expect("lock session id") =
+                            Some(local_session_id.clone());
+                        send_ready(&ready_for_task, Ok(local_session_id));
+                        wait_for_acp_shutdown(&mut shutdown_rx).await;
+                        Ok(())
+                    },
+                )
+                .await;
+
+            if let Err(error) = connection_result {
+                send_ready(
+                    &ready_tx,
+                    Err(AiError::ProviderError(format!(
+                        "ACP agent {command_summary} failed while restoring a session: {error}"
+                    ))),
+                );
+            }
+            if let Some(session_id) = cleanup_session_id.lock().expect("lock session id").take() {
+                if let Ok(handle) = state.remove_acp_session(&session_id) {
+                    handle.request_shutdown();
+                }
+            }
+        });
+
+        let session_result =
+            await_ready_session(ready_rx, self.command_summary(), ACP_SESSION_READY_TIMEOUT).await;
+        if session_result.is_err() {
+            let _ = shutdown_tx.send(true);
+            task.abort();
+        }
+        let session_id = session_result?;
+        Ok(NewSessionPayload { session_id })
+    }
+
+    async fn cancel(&self, state: &AiState, session_id: &str) -> Result<(), AiError> {
+        state.get_acp_session(session_id)?.cancel().await
+    }
+
+    async fn close_session(&self, state: &AiState, session_id: &str) -> Result<(), AiError> {
+        let handle = state.remove_acp_session(session_id)?;
+        handle.request_shutdown();
+        Ok(())
+    }
+}
+
+fn send_ready(
+    sender: &Arc<std::sync::Mutex<Option<oneshot::Sender<Result<String, AiError>>>>>,
+    result: Result<String, AiError>,
+) {
+    if let Some(sender) = sender.lock().expect("lock ready sender").take() {
+        let _ = sender.send(result);
+    }
+}
+
+async fn await_ready_session(
+    receiver: oneshot::Receiver<Result<String, AiError>>,
+    command_summary: String,
+    timeout_duration: Duration,
+) -> Result<String, AiError> {
+    match timeout(timeout_duration, receiver).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(AiError::ProviderError(format!(
+            "ACP agent {command_summary} exited before creating a session"
+        ))),
+        Err(_) => Err(AiError::ProviderError(format!(
+            "ACP agent {command_summary} timed out while creating a session"
+        ))),
+    }
+}

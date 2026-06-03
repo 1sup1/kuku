@@ -128,4 +128,50 @@ describe("files settings dialog state", () => {
     expect(files.filesState.activeTabId).toBe("tab-1");
     expect(files.filesState.settingsDialogOpen).toBe(false);
   });
+
+  it("opens a non-persisted placeholder tab without a file path", async () => {
+    const files = await loadFilesModule();
+
+    files.openTab("Note", "Note.md", "editor");
+    files.openNewTabPlaceholder();
+
+    expect(files.filesState.tabs).toHaveLength(2);
+    expect(files.filesState.tabs[1]).toMatchObject({
+      id: "tab-2",
+      fileName: "New Tab",
+      filePath: null,
+      type: "placeholder",
+    });
+    expect(files.filesState.activeTabId).toBe("tab-2");
+
+    files.openNewTabPlaceholder();
+
+    expect(files.filesState.tabs).toHaveLength(2);
+    expect(files.filesState.activeTabId).toBe("tab-2");
+    expect(JSON.parse(localStorage.getItem("tabs-state") ?? "{}")).toMatchObject({
+      tabs: [
+        {
+          fileName: "Note",
+          filePath: "Note.md",
+          type: "editor",
+        },
+      ],
+      activeFilePath: null,
+    });
+  });
+
+  it("replaces the active placeholder when opening a real tab", async () => {
+    const files = await loadFilesModule();
+
+    files.openNewTabPlaceholder();
+    files.openTab("Note", "Note.md", "editor");
+
+    expect(files.filesState.tabs).toHaveLength(1);
+    expect(files.filesState.tabs[0]).toMatchObject({
+      id: "tab-2",
+      type: "editor",
+      filePath: "Note.md",
+    });
+    expect(files.filesState.activeTabId).toBe("tab-2");
+  });
 });

@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::mutation::MutationPlan;
 
@@ -16,6 +17,94 @@ pub enum ChatMode {
     Ask,
     Agent,
     Inline,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+#[allow(dead_code)]
+pub struct AgentId(pub String);
+
+#[allow(dead_code)]
+impl AgentId {
+    pub fn kuku_native() -> Self {
+        Self("kuku-native".to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub enum AgentKind {
+    Native,
+    Acp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct AgentDescriptor {
+    pub id: AgentId,
+    pub label: String,
+    pub kind: AgentKind,
+    pub enabled: bool,
+    pub managed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalAgentConfig {
+    pub id: String,
+    pub label: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedAgentSession {
+    pub local_session_id: String,
+    pub external_session_id: Option<String>,
+    pub agent_id: AgentId,
+    pub title: String,
+    pub updated_at_ms: u64,
+    pub supports_load: bool,
+    pub supports_resume: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedChatSessionSnapshot {
+    pub id: String,
+    pub external_session_id: Option<String>,
+    pub agent_id: AgentId,
+    pub mode: ChatMode,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persisted_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_load: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_resume: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    pub draft: String,
+    pub auto_approve: bool,
+    #[serde(default)]
+    pub messages: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAgentSessionRequest {
+    pub agent_id: AgentId,
+    pub mode: ChatMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +135,8 @@ pub struct AiConfig {
     pub api_key: Option<String>,
     pub model: String,
     pub server_url: Option<String>,
+    #[serde(default)]
+    pub external_agents: Vec<ExternalAgentConfig>,
     pub round_limit: u32,
     pub proxy_tool_timeout_ms: u64,
 }
@@ -57,6 +148,7 @@ impl Default for AiConfig {
             api_key: None,
             model: "gemini-3.1-flash-lite".to_string(),
             server_url: Some(default_server_url()),
+            external_agents: Vec::new(),
             round_limit: 12,
             proxy_tool_timeout_ms: 15_000,
         }
@@ -117,7 +209,11 @@ pub enum FinishReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ChatMessage {
     System {
         content: String,
@@ -214,4 +310,38 @@ pub struct ProxyToolCallPayload {
     pub tool_id: String,
     pub tool_name: String,
     pub arguments: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ChatMessage;
+    use serde_json::json;
+
+    #[test]
+    fn chat_message_tool_result_accepts_camel_case_restore_payload() {
+        let message: ChatMessage = serde_json::from_value(json!({
+            "kind": "toolResult",
+            "callId": "call-1",
+            "toolName": "read_file",
+            "output": "done",
+            "isError": false,
+        }))
+        .expect("tool result restore payload should deserialize");
+
+        match message {
+            ChatMessage::ToolResult {
+                call_id,
+                tool_name,
+                output,
+                is_error,
+                ..
+            } => {
+                assert_eq!(call_id, "call-1");
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(output, "done");
+                assert!(!is_error);
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
 }

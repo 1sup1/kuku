@@ -1,7 +1,6 @@
 import { ErrorBoundary, onCleanup, Show, Suspense } from "solid-js";
 import { Dynamic } from "solid-js/web";
 
-import RightPanelTabBar from "~/components/layout/right_panel_tab_bar";
 import { t } from "~/i18n";
 import { createFocusZone } from "~/plugins/focus_zone";
 import { pluginsReady } from "~/plugins/bootstrap";
@@ -21,10 +20,9 @@ export default function RightPanel() {
   return (
     <aside
       ref={(el) => onCleanup(createFocusZone(el, "right"))}
-      class="flex h-full shrink-0 flex-col overflow-hidden border-l border-border bg-bg-secondary"
+      class="flex h-full shrink-0 flex-col overflow-hidden bg-bg-secondary"
       style={{ width: `${layoutState.rightPanelWidth}px` }}
     >
-      <RightPanelTabBar />
       <Show when={pluginsReady()} fallback={<PluginSkeleton />}>
         <Show
           when={activeFill()}

@@ -1,10 +1,12 @@
-import { createEffect, onCleanup, onMount } from "solid-js";
+import { createEffect, onCleanup, onMount, Show } from "solid-js";
 
 import { PanelLeftIcon, PanelRightIcon } from "~/components/icons";
 import PanelLayout from "~/components/layout/panel_layout";
+import RightPanelTabBar from "~/components/layout/right_panel_tab_bar";
 import SettingsDialog from "~/components/settings/settings_dialog";
+import SideResizeBoundary from "~/components/layout/side_resize_boundary";
+import TabBar from "~/components/layout/tab_bar";
 import TitleBar from "~/components/layout/title_bar";
-import UpdateIndicator from "~/components/layout/update_indicator";
 import VaultBrowser from "~/components/vault/vault_browser";
 
 import { currentLocale, t } from "~/i18n";
@@ -21,19 +23,34 @@ import { Slot } from "~/plugins/slots";
 import { initSettings, settingsState } from "~/stores/settings";
 import { initTheme } from "~/stores/theme";
 import { checkForUpdates } from "~/stores/updater";
-import { closeVault, openVault, syncConfiguredVaultSelection, vaultState } from "~/stores/vault";
+import { closeVault, openVault, syncConfiguredVaultSelection } from "~/stores/vault";
 import {
   destroyWindowListeners,
   initWindowListeners,
   layoutState,
+  setLeftPanelWidth,
+  setRightPanelWidth,
   toggleLeftPanel,
   toggleRightPanel,
 } from "~/stores/layout";
 
 // ── Styles ──
 
-const ACTION_BTN =
-  "flex size-[26px] cursor-pointer items-center justify-center rounded-xs border-none bg-transparent text-icon-muted transition-all duration-150 hover:bg-ghost-hover hover:text-icon active:bg-ghost-active [&>svg]:size-3.5";
+const RESIZE_HANDLE_PX = 1;
+const COLLAPSED_LEFT_RAIL_PX = 0;
+const TITLE_BAR_LEFT_CHROME_PX = 112;
+const TITLE_BAR_LEFT_CHROME_FULLSCREEN_PX = 64;
+
+const SIDEBAR_TOGGLE_BTN =
+  "flex size-5 cursor-pointer items-center justify-center rounded-xs border-none bg-transparent text-icon-muted transition-all duration-150 hover:bg-ghost-hover hover:text-icon active:bg-ghost-active [&>svg]:size-3.5";
+const DRAG = {
+  "-webkit-app-region": "drag",
+  "app-region": "drag",
+} as Record<string, string>;
+const NO_DRAG = {
+  "-webkit-app-region": "no-drag",
+  "app-region": "no-drag",
+} as Record<string, string>;
 
 // ── Component ──
 
@@ -165,35 +182,78 @@ export default function App() {
     }
   }
 
+  function titleBarLeftPanelColumn(): string {
+    const panelColumnWidth = layoutState.leftPanelOpen
+      ? `${layoutState.leftPanelWidth + RESIZE_HANDLE_PX}px`
+      : `${COLLAPSED_LEFT_RAIL_PX}px`;
+    const chromeColumnWidth = layoutState.isFullscreen
+      ? TITLE_BAR_LEFT_CHROME_FULLSCREEN_PX
+      : TITLE_BAR_LEFT_CHROME_PX;
+
+    return `max(${panelColumnWidth}, ${chromeColumnWidth}px)`;
+  }
+
+  function titleBarRightPanelColumn(): string {
+    const panelColumnWidth = layoutState.rightPanelOpen
+      ? `${layoutState.rightPanelWidth + RESIZE_HANDLE_PX}px`
+      : "0px";
+
+    return panelColumnWidth;
+  }
+
+  function titleBarGridTemplateColumns(): string {
+    return `${titleBarLeftPanelColumn()} minmax(0, 1fr) ${titleBarRightPanelColumn()}`;
+  }
+
   return (
-    <div class="flex h-screen w-screen flex-col overflow-hidden">
+    <div class="relative flex h-screen w-screen flex-col overflow-hidden">
       <TitleBar
-        left={
-          <>
-            <button
-              type="button"
-              class={ACTION_BTN}
-              classList={{ "text-text-secondary!": layoutState.leftPanelOpen }}
-              onClick={toggleLeftPanel}
-              title={t("app.action.toggle_left_panel")}
-            >
-              <PanelLeftIcon active={layoutState.leftPanelOpen} />
-            </button>
-            <UpdateIndicator />
-            <Slot name="titleBarLeftAction" />
-          </>
-        }
+        left={<Slot name="titleBarLeftAction" />}
         center={
-          <span class="text-xs text-text-muted">
-            {vaultState.rootName ?? t("app.title.vault_fallback")}
-          </span>
+          <div
+            class="grid h-full min-w-0 flex-1 items-stretch"
+            data-kuku-titlebar-panel-grid="true"
+            data-tauri-drag-region
+            style={{ ...DRAG, "grid-template-columns": titleBarGridTemplateColumns() }}
+          >
+            <div
+              class="relative flex h-full items-center justify-end border-r border-border bg-bg-secondary px-1"
+              data-kuku-titlebar-left-toggle-cell="true"
+              data-tauri-drag-region
+            >
+              <span
+                data-kuku-titlebar-left-toggle-bottom-divider="true"
+                class="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border"
+                classList={{ hidden: layoutState.leftPanelOpen }}
+                aria-hidden="true"
+              />
+              <button
+                type="button"
+                class={SIDEBAR_TOGGLE_BTN}
+                classList={{ "text-text-secondary!": layoutState.leftPanelOpen }}
+                style={NO_DRAG}
+                onClick={toggleLeftPanel}
+                title={t("app.action.toggle_left_panel")}
+              >
+                <PanelLeftIcon active={layoutState.leftPanelOpen} />
+              </button>
+            </div>
+            <div class="flex h-full min-w-0" classList={{ "pr-8": !layoutState.rightPanelOpen }}>
+              <TabBar />
+            </div>
+            <Show when={layoutState.rightPanelOpen}>
+              <div class="flex h-full min-w-0">
+                <RightPanelTabBar />
+              </div>
+            </Show>
+          </div>
         }
         right={
           <>
             <Slot name="titleBarRightAction" />
             <button
               type="button"
-              class={ACTION_BTN}
+              class={SIDEBAR_TOGGLE_BTN}
               classList={{ "text-text-secondary!": layoutState.rightPanelOpen }}
               onClick={toggleRightPanel}
               title={t("app.action.toggle_right_panel")}
@@ -207,6 +267,21 @@ export default function App() {
         left={<VaultBrowser />}
         bottom={<p class="p-3 text-xs text-text-muted">{t("app.bottom_panel.placeholder")}</p>}
       />
+      <Show when={layoutState.leftPanelOpen}>
+        <SideResizeBoundary
+          side="left"
+          getValue={() => layoutState.leftPanelWidth}
+          onResize={setLeftPanelWidth}
+        />
+      </Show>
+      <Show when={layoutState.rightPanelOpen}>
+        <SideResizeBoundary
+          side="right"
+          getValue={() => layoutState.rightPanelWidth}
+          onResize={setRightPanelWidth}
+          reverse
+        />
+      </Show>
       <SettingsDialog />
       <div class="pointer-events-none fixed inset-0 z-50">
         <Slot name="overlay" />

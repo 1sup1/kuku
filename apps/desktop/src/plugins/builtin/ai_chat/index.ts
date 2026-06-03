@@ -8,7 +8,14 @@ import type { KukuPlugin } from "~/plugins/types";
 
 import { createAiEventBridge } from "./event_bridge";
 import { createProxyToolBridge } from "./proxy_tool_bridge";
-import { clearPersistedConfig, loadConfig, loadTools, resetChatState } from "./chat_store";
+import {
+  clearPersistedConfig,
+  loadAgents,
+  loadConfig,
+  loadSessions,
+  loadTools,
+  resetChatState,
+} from "./chat_store";
 
 const ChatPanelView = lazy(() => import("./chat_panel"));
 const AiSettingsView = lazy(() =>
@@ -77,9 +84,16 @@ const aiChatPlugin: KukuPlugin = {
 
     const disposeEvents = await createAiEventBridge();
     ctx.track(disposeEvents);
+    ctx.events.on("vault:opened", ({ rootPath }) => {
+      void loadSessions(rootPath);
+    });
+    ctx.events.on("vault:closed", () => {
+      void loadSessions(null);
+    });
 
     try {
-      await Promise.all([loadConfig(), loadTools()]);
+      await loadConfig();
+      await Promise.all([loadAgents(), loadSessions(), loadTools()]);
     } catch {
       // Keep defaults if the backend plugin is not ready yet.
     }

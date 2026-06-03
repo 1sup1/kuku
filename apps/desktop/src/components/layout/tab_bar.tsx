@@ -12,7 +12,6 @@ import {
 
 import {
   CloseIcon,
-  EllipsisVerticalIcon,
   FileIcon,
   GraphIcon,
   PlusIcon,
@@ -22,18 +21,15 @@ import {
 import ScrollArea, { type ScrollAreaHandle } from "~/components/scroll_area";
 import { t } from "~/i18n";
 import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "~/components/ui";
-import { executePluginCommand, isPluginCommandVisible } from "~/plugins/commands";
-import { getTabBarMoreActionIds } from "~/components/layout/tab_bar_actions";
-import { closeTab, filesState, openTab, reorderTabs, setActiveTab } from "~/stores/files";
+  closeTab,
+  filesState,
+  openNewTabPlaceholder,
+  reorderTabs,
+  setActiveTab,
+} from "~/stores/files";
 import {
   cancelEdit,
   confirmEdit,
-  createAndOpenNewFile,
   startRename,
   updateEditName,
   vaultState,
@@ -53,8 +49,15 @@ function stripExtension(name: string): string {
 
 // ── Styles ──
 
-const ACTION_BTN =
-  "flex size-[26px] cursor-pointer items-center justify-center rounded-xs border-none bg-transparent text-icon-muted transition-all duration-100 hover:bg-ghost-hover hover:text-icon data-[expanded]:bg-ghost-hover data-[expanded]:text-icon";
+const DRAG = {
+  "-webkit-app-region": "drag",
+  "app-region": "drag",
+} as Record<string, string>;
+
+const NO_DRAG = {
+  "-webkit-app-region": "no-drag",
+  "app-region": "no-drag",
+} as Record<string, string>;
 
 // ── Component ──
 
@@ -95,8 +98,6 @@ function TabRenameInput(props: { editState: EditState }) {
 }
 
 export default function TabBar() {
-  const moreActionIds = getTabBarMoreActionIds();
-
   let scrollHandle: ScrollAreaHandle | undefined;
 
   const getViewport = () => scrollHandle?.viewport;
@@ -132,6 +133,12 @@ export default function TabBar() {
   createEffect(() => {
     // Re-runs whenever activeTabId changes.
     scrollActiveTabIntoView();
+  });
+
+  createEffect(() => {
+    if (filesState.tabs.length === 0) {
+      openNewTabPlaceholder();
+    }
   });
 
   // ── Drag-to-reorder (mirrors file-browser drag UX) ──
@@ -324,11 +331,20 @@ export default function TabBar() {
   };
 
   return (
-    <div class="tab-bar relative z-10 bg-bg-secondary">
-      <div class="flex h-9.5 items-stretch">
+    <div
+      class="tab-bar relative z-10 flex h-full min-w-0 flex-1 bg-bg-secondary"
+      style={DRAG}
+      data-tauri-drag-region
+    >
+      <div
+        data-kuku-tabbar-bottom-divider="true"
+        class="pointer-events-none absolute inset-x-0 bottom-0 z-0 h-px bg-border"
+        aria-hidden="true"
+      />
+      <div class="relative z-10 flex h-full min-w-0 flex-1 items-stretch">
         {/* ── Tab list (horizontal scroll with visible scrollbar) ── */}
         <ScrollArea
-          class="tab-bar-tabs min-w-0 flex-1"
+          class="tab-bar-tabs h-full min-w-0 flex-1"
           axis="x"
           handleRef={(handle) => {
             scrollHandle = handle;
@@ -336,12 +352,15 @@ export default function TabBar() {
           horizontalWheel
           scrollbarVisibility="hidden"
         >
-          <div class="flex h-full items-stretch">
+          <div
+            class="flex h-full min-w-full items-stretch"
+            style={DRAG}
+            data-kuku-tabbar-drag-track="true"
+            data-tauri-drag-region
+          >
             <For each={filesState.tabs}>
               {(tab, index) => {
                 const isActive = () => tab.id === filesState.activeTabId;
-                const showTabIcon = () =>
-                  tab.type === "graph" || tab.type === "search" || tab.type === "settings";
                 const isDragging = () => draggingTabId() === tab.id;
                 const showDropBefore = () =>
                   draggingTabId() !== null && dropIndex() === index() && draggingTabId() !== tab.id;
@@ -363,54 +382,58 @@ export default function TabBar() {
                   <>
                     {/* Drop indicator (before this tab) */}
                     <Show when={showDropBefore()}>
-                      <span class="mx-0.5 h-6 w-0.5 shrink-0 rounded-xs bg-accent/70" />
+                      <span class="mx-0.5 w-0.5 shrink-0 self-stretch bg-accent/70" />
                     </Show>
 
                     {/* Tab */}
                     <div
                       data-tab-id={tab.id}
+                      data-kuku-tab-hit-area="true"
                       class={`group/tab relative flex min-w-28 max-w-52 shrink-0 cursor-pointer items-center gap-1.5 border-r border-border px-3 pb-px text-[0.8125rem] leading-normal whitespace-nowrap transition-colors duration-100 select-none ${
                         isActive()
-                          ? "z-10 -mb-px bg-bg-primary text-text-primary"
-                          : "border-b border-border bg-bg-secondary text-text-muted hover:bg-bg-tertiary hover:text-text-secondary"
+                          ? "z-10 bg-bg-primary text-text-primary"
+                          : "bg-bg-secondary text-text-muted hover:bg-bg-tertiary hover:text-text-secondary"
                       } ${isDragging() ? "opacity-40" : ""}`}
+                      style={NO_DRAG}
                       onClick={(e) => handleTabClick(tab.id, e)}
                       onMouseDown={(e) => handleTabMouseDown(tab.id, e)}
                     >
+                      <span
+                        data-kuku-tab-bottom-divider="true"
+                        class="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border"
+                        aria-hidden="true"
+                      />
                       <Show when={isActive()}>
-                        <span class="pointer-events-none absolute inset-x-0 -bottom-px h-px bg-bg-primary" />
+                        <span
+                          data-kuku-active-tab-divider-mask="true"
+                          class="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-bg-primary"
+                          aria-hidden="true"
+                        />
                       </Show>
 
                       {/* Tab icon */}
-                      <Show when={showTabIcon()}>
-                        <span
-                          class={`shrink-0 leading-none ${isActive() ? "text-icon" : "text-icon-muted"}`}
-                        >
-                          <Switch fallback={<FileIcon size={14} />}>
-                            <Match when={tab.type === "graph"}>
-                              <GraphIcon size={14} />
-                            </Match>
-                            <Match when={tab.type === "search"}>
-                              <SearchIcon size={14} />
-                            </Match>
-                            <Match when={tab.type === "settings"}>
-                              <SettingsIcon size={14} />
-                            </Match>
-                          </Switch>
-                        </span>
-                      </Show>
-
-                      {/* Dirty indicator */}
-                      <Show when={tab.isDirty}>
-                        <span class="size-1 shrink-0 rounded-full bg-accent" />
-                      </Show>
+                      <span
+                        class={`shrink-0 leading-none ${isActive() ? "text-icon" : "text-icon-muted"}`}
+                      >
+                        <Switch fallback={<FileIcon size={14} />}>
+                          <Match when={tab.type === "graph"}>
+                            <GraphIcon size={14} />
+                          </Match>
+                          <Match when={tab.type === "search"}>
+                            <SearchIcon size={14} />
+                          </Match>
+                          <Match when={tab.type === "settings"}>
+                            <SettingsIcon size={14} />
+                          </Match>
+                        </Switch>
+                      </span>
 
                       {/* Tab name */}
                       <Show
                         when={rowEditState()}
                         fallback={
                           <span
-                            class="min-w-0 flex-1 truncate leading-none"
+                            class="min-w-0 flex-1 truncate leading-normal"
                             onDblClick={(event) => {
                               if (tab.type !== "editor" || !tab.filePath) return;
                               event.preventDefault();
@@ -418,11 +441,18 @@ export default function TabBar() {
                               startRename(tab.filePath, "tab");
                             }}
                           >
-                            {stripExtension(tab.fileName)}
+                            {tab.type === "placeholder"
+                              ? t("tabbar.action.new_tab")
+                              : stripExtension(tab.fileName)}
                           </span>
                         }
                       >
                         {(editState) => <TabRenameInput editState={editState()} />}
+                      </Show>
+
+                      {/* Dirty indicator */}
+                      <Show when={tab.isDirty}>
+                        <span class="size-1 shrink-0 rounded-full bg-accent" />
                       </Show>
 
                       {/* Close button */}
@@ -444,55 +474,32 @@ export default function TabBar() {
 
                     {/* Drop indicator (after the last tab) */}
                     <Show when={showDropAfter()}>
-                      <span class="mx-0.5 h-6 w-0.5 shrink-0 rounded-xs bg-accent/70" />
+                      <span class="mx-0.5 w-0.5 shrink-0 self-stretch bg-accent/70" />
                     </Show>
                   </>
                 );
               }}
             </For>
-          </div>
-        </ScrollArea>
 
-        {/* ── Actions ── */}
-        <div class="w-px shrink-0 self-stretch bg-border" aria-hidden="true" />
-        <div class="flex shrink-0 items-center gap-0.5 border-b border-border bg-bg-secondary px-1">
-          <button
-            type="button"
-            class={ACTION_BTN}
-            onClick={() => void createAndOpenNewFile()}
-            title={t("tabbar.action.new_tab")}
-          >
-            <PlusIcon />
-          </button>
-
-          <Show when={isPluginCommandVisible("graph.cycle")}>
             <button
               type="button"
-              class={ACTION_BTN}
-              onClick={() => {
-                void executePluginCommand("graph.cycle");
-              }}
-              title={t("tabbar.action.graph_shortcut")}
+              data-kuku-inline-new-tab-button="true"
+              class="relative flex h-full w-8 shrink-0 cursor-pointer items-center justify-center bg-bg-secondary text-icon-muted transition-colors duration-100 hover:bg-bg-tertiary hover:text-icon active:bg-ghost-active"
+              style={NO_DRAG}
+              onClick={() => openNewTabPlaceholder()}
+              onMouseDown={(event) => event.stopPropagation()}
+              title={t("tabbar.action.new_tab")}
+              aria-label={t("tabbar.action.new_tab")}
             >
-              <GraphIcon size={14} />
+              <span
+                data-kuku-tab-bottom-divider="true"
+                class="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-border"
+                aria-hidden="true"
+              />
+              <PlusIcon />
             </button>
-          </Show>
-
-          <DropdownMenu>
-            <DropdownMenuTrigger class={ACTION_BTN} title={t("tabbar.action.more_actions")}>
-              <EllipsisVerticalIcon />
-            </DropdownMenuTrigger>
-            <DropdownMenuContent>
-              <Show when={moreActionIds.includes("advanced-search")}>
-                <DropdownMenuItem
-                  label={t("center.empty.advanced_search")}
-                  shortcut="⌘U"
-                  onSelect={() => openTab(t("center.empty.advanced_search"), null, "search")}
-                />
-              </Show>
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
+          </div>
+        </ScrollArea>
       </div>
 
       {/* Floating drag preview — mirrors the file browser's DragPreview */}

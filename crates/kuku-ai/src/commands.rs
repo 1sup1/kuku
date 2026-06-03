@@ -1,56 +1,142 @@
 use tauri::{AppHandle, State, Wry, command};
 
+use std::path::PathBuf;
+
 use crate::{
-    AiConfig, AiState, ChatMode, EditorContext, NewSessionPayload, ProxyToolDescriptor,
-    ProxyToolResult, session,
+    AgentId, AiConfig, AiError, AiState, ChatMode, EditorContext, NewSessionPayload,
+    PersistedAgentSession, PersistedChatSessionSnapshot, ProxyToolDescriptor, ProxyToolResult,
+    agent_runtime::{AgentNewSessionRequest, AgentRestoreSessionRequest, AgentSendMessageRequest},
+    types::ChatMessage,
 };
 
 #[command]
 pub async fn ai_new_session(
+    app: AppHandle<Wry>,
     state: State<'_, AiState>,
     mode: ChatMode,
+    agent_id: Option<AgentId>,
+    working_directory: Option<String>,
 ) -> Result<NewSessionPayload, String> {
-    let session = state.create_session(mode);
-    Ok(NewSessionPayload {
-        session_id: session.id.clone(),
-    })
+    let agent_id = agent_id.unwrap_or_else(AgentId::kuku_native);
+    let working_directory_path = working_directory
+        .as_ref()
+        .map(|directory| PathBuf::from(directory));
+    let runtime = state
+        .runtime_for_agent(&agent_id)
+        .map_err(|error| error.to_string())?;
+    let payload = runtime
+        .new_session(
+            app,
+            &state,
+            AgentNewSessionRequest {
+                mode,
+                working_directory: working_directory_path,
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Err(error) =
+        state.record_agent_session(payload.session_id.clone(), agent_id, working_directory)
+    {
+        log::warn!("failed to persist AI session metadata: {error}");
+    }
+    Ok(payload)
+}
+
+#[command]
+pub async fn ai_restore_session(
+    app: AppHandle<Wry>,
+    state: State<'_, AiState>,
+    mode: ChatMode,
+    agent_id: Option<AgentId>,
+    session_id: String,
+    external_session_id: Option<String>,
+    working_directory: Option<String>,
+    messages: Option<Vec<ChatMessage>>,
+) -> Result<NewSessionPayload, String> {
+    let agent_id = agent_id.unwrap_or_else(AgentId::kuku_native);
+    let runtime = state
+        .runtime_for_agent(&agent_id)
+        .map_err(|error| error.to_string())?;
+    runtime
+        .restore_session(
+            app,
+            &state,
+            AgentRestoreSessionRequest {
+                session_id,
+                external_session_id,
+                mode,
+                working_directory: working_directory.map(PathBuf::from),
+                messages: messages.unwrap_or_default(),
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[command]
 pub async fn ai_send_message(
     app: AppHandle<Wry>,
     state: State<'_, AiState>,
+    agent_id: Option<AgentId>,
     session_id: String,
     mode: ChatMode,
     content: String,
     editor_context: Option<EditorContext>,
 ) -> Result<(), String> {
-    let session = state
-        .get_session(&session_id)
+    let agent_id = agent_id.unwrap_or_else(AgentId::kuku_native);
+    let runtime = state
+        .runtime_for_agent(&agent_id)
         .map_err(|error| error.to_string())?;
-    let state_clone = state.inner().clone();
-    let app_clone = app.clone();
-    tauri::async_runtime::spawn(async move {
-        session::run_turn(
-            app_clone,
-            state_clone,
-            session,
-            mode,
-            content,
-            editor_context.unwrap_or_default(),
+    runtime
+        .send_message(
+            app,
+            state.inner().clone(),
+            AgentSendMessageRequest {
+                session_id: session_id.clone(),
+                mode,
+                content: content.clone(),
+                editor_context: editor_context.unwrap_or_default(),
+            },
         )
-        .await;
-    });
-    Ok(())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[command]
-pub async fn ai_cancel(state: State<'_, AiState>, session_id: String) -> Result<(), String> {
-    let session = state
-        .get_session(&session_id)
+pub async fn ai_cancel(
+    state: State<'_, AiState>,
+    agent_id: Option<AgentId>,
+    session_id: String,
+) -> Result<(), String> {
+    let agent_id = agent_id.unwrap_or_else(AgentId::kuku_native);
+    let runtime = state
+        .runtime_for_agent(&agent_id)
         .map_err(|error| error.to_string())?;
-    session.cancel();
-    Ok(())
+    runtime
+        .cancel(&state, &session_id)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[command]
+pub async fn ai_close_session(
+    state: State<'_, AiState>,
+    agent_id: Option<AgentId>,
+    session_id: String,
+) -> Result<(), String> {
+    let agent_id = agent_id.unwrap_or_else(AgentId::kuku_native);
+    match state.runtime_for_agent(&agent_id) {
+        Ok(runtime) => match runtime.close_session(&state, &session_id).await {
+            Ok(()) | Err(AiError::SessionNotFound) => {}
+            Err(error) => return Err(error.to_string()),
+        },
+        Err(AiError::AgentUnavailable(_) | AiError::UnknownAgent(_)) => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    state
+        .remove_agent_session(&session_id)
+        .map_err(|error| error.to_string())
 }
 
 #[command]
@@ -76,17 +162,51 @@ pub async fn ai_list_tools(
 }
 
 #[command]
+pub async fn ai_list_agents(
+    state: State<'_, AiState>,
+) -> Result<Vec<crate::AgentDescriptor>, String> {
+    Ok(state.agent_descriptors())
+}
+
+#[command]
+pub async fn ai_list_sessions(
+    state: State<'_, AiState>,
+    working_directory: Option<String>,
+) -> Result<Vec<PersistedAgentSession>, String> {
+    Ok(state.persisted_sessions_for_working_directory(working_directory.as_deref()))
+}
+
+#[command]
+pub async fn ai_list_chat_sessions(
+    state: State<'_, AiState>,
+    working_directory: Option<String>,
+) -> Result<Vec<PersistedChatSessionSnapshot>, String> {
+    Ok(state.persisted_chat_sessions_for_working_directory(working_directory.as_deref()))
+}
+
+#[command]
+pub async fn ai_save_chat_sessions(
+    state: State<'_, AiState>,
+    working_directory: Option<String>,
+    sessions: Vec<PersistedChatSessionSnapshot>,
+) -> Result<(), String> {
+    state
+        .replace_persisted_chat_sessions_for_working_directory(
+            working_directory.as_deref(),
+            sessions,
+        )
+        .map_err(|error| error.to_string())
+}
+
+#[command]
 pub async fn ai_resolve_approval(
     state: State<'_, AiState>,
     session_id: String,
     call_id: String,
     approved: bool,
 ) -> Result<(), String> {
-    let session = state
-        .get_session(&session_id)
-        .map_err(|error| error.to_string())?;
-    session
-        .resolve_approval(&call_id, approved)
+    state
+        .resolve_approval(&session_id, &call_id, approved)
         .map_err(|error| error.to_string())
 }
 

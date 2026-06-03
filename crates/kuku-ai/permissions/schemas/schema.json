@@ -307,6 +307,18 @@
           "markdownDescription": "Denies the ai_cancel command without any pre-configured scope."
         },
         {
+          "description": "Enables the ai_close_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-close-session",
+          "markdownDescription": "Enables the ai_close_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_close_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-close-session",
+          "markdownDescription": "Denies the ai_close_session command without any pre-configured scope."
+        },
+        {
           "description": "Enables the ai_get_config command without any pre-configured scope.",
           "type": "string",
           "const": "allow-ai-get-config",
@@ -317,6 +329,42 @@
           "type": "string",
           "const": "deny-ai-get-config",
           "markdownDescription": "Denies the ai_get_config command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_list_agents command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-list-agents",
+          "markdownDescription": "Enables the ai_list_agents command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_list_agents command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-list-agents",
+          "markdownDescription": "Denies the ai_list_agents command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_list_chat_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-list-chat-sessions",
+          "markdownDescription": "Enables the ai_list_chat_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_list_chat_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-list-chat-sessions",
+          "markdownDescription": "Denies the ai_list_chat_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_list_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-list-sessions",
+          "markdownDescription": "Enables the ai_list_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_list_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-list-sessions",
+          "markdownDescription": "Denies the ai_list_sessions command without any pre-configured scope."
         },
         {
           "description": "Enables the ai_list_tools command without any pre-configured scope.",
@@ -379,6 +427,30 @@
           "markdownDescription": "Denies the ai_resolve_approval command without any pre-configured scope."
         },
         {
+          "description": "Enables the ai_restore_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-restore-session",
+          "markdownDescription": "Enables the ai_restore_session command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_restore_session command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-restore-session",
+          "markdownDescription": "Denies the ai_restore_session command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the ai_save_chat_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-ai-save-chat-sessions",
+          "markdownDescription": "Enables the ai_save_chat_sessions command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the ai_save_chat_sessions command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-ai-save-chat-sessions",
+          "markdownDescription": "Denies the ai_save_chat_sessions command without any pre-configured scope."
+        },
+        {
           "description": "Enables the ai_send_message command without any pre-configured scope.",
           "type": "string",
           "const": "allow-ai-send-message",
@@ -427,10 +499,10 @@
           "markdownDescription": "Denies the ai_unregister_proxy_tool command without any pre-configured scope."
         },
         {
-          "description": "Allows the AI plugin commands.\n#### This default permission set includes:\n\n- `allow-ai-new-session`\n- `allow-ai-send-message`\n- `allow-ai-cancel`\n- `allow-ai-get-config`\n- `allow-ai-set-config`\n- `allow-ai-reset-state`\n- `allow-ai-list-tools`\n- `allow-ai-resolve-approval`\n- `allow-ai-register-proxy-tool`\n- `allow-ai-unregister-proxy-tool`\n- `allow-ai-submit-proxy-tool-result`",
+          "description": "Allows the AI plugin commands.\n#### This default permission set includes:\n\n- `allow-ai-new-session`\n- `allow-ai-restore-session`\n- `allow-ai-send-message`\n- `allow-ai-cancel`\n- `allow-ai-close-session`\n- `allow-ai-get-config`\n- `allow-ai-set-config`\n- `allow-ai-reset-state`\n- `allow-ai-list-tools`\n- `allow-ai-list-agents`\n- `allow-ai-list-sessions`\n- `allow-ai-list-chat-sessions`\n- `allow-ai-save-chat-sessions`\n- `allow-ai-resolve-approval`\n- `allow-ai-register-proxy-tool`\n- `allow-ai-unregister-proxy-tool`\n- `allow-ai-submit-proxy-tool-result`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Allows the AI plugin commands.\n#### This default permission set includes:\n\n- `allow-ai-new-session`\n- `allow-ai-send-message`\n- `allow-ai-cancel`\n- `allow-ai-get-config`\n- `allow-ai-set-config`\n- `allow-ai-reset-state`\n- `allow-ai-list-tools`\n- `allow-ai-resolve-approval`\n- `allow-ai-register-proxy-tool`\n- `allow-ai-unregister-proxy-tool`\n- `allow-ai-submit-proxy-tool-result`"
+          "markdownDescription": "Allows the AI plugin commands.\n#### This default permission set includes:\n\n- `allow-ai-new-session`\n- `allow-ai-restore-session`\n- `allow-ai-send-message`\n- `allow-ai-cancel`\n- `allow-ai-close-session`\n- `allow-ai-get-config`\n- `allow-ai-set-config`\n- `allow-ai-reset-state`\n- `allow-ai-list-tools`\n- `allow-ai-list-agents`\n- `allow-ai-list-sessions`\n- `allow-ai-list-chat-sessions`\n- `allow-ai-save-chat-sessions`\n- `allow-ai-resolve-approval`\n- `allow-ai-register-proxy-tool`\n- `allow-ai-unregister-proxy-tool`\n- `allow-ai-submit-proxy-tool-result`"
         }
       ]
     }
